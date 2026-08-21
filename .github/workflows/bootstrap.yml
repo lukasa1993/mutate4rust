@@ -1,0 +1,40 @@
+name: Apply production hardening
+
+on:
+  push:
+    branches: [production-v1]
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: ${{ !contains(github.event.head_commit.message, '[generated]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch the tested generator
+        run: |
+          mkdir -p /tmp/quality-tool-generator
+          base="https://raw.githubusercontent.com/lukasa1993/crap4rust/main/tools"
+          curl --fail --silent --show-error --location "$base/quality_tool_generator.py" --output /tmp/quality-tool-generator/quality_tool_generator.py
+          curl --fail --silent --show-error --location "$base/_quality_tool_generator_data_1.py" --output /tmp/quality-tool-generator/_quality_tool_generator_data_1.py
+          curl --fail --silent --show-error --location "$base/_quality_tool_generator_data_2.py" --output /tmp/quality-tool-generator/_quality_tool_generator_data_2.py
+          curl --fail --silent --show-error --location "$base/_quality_tool_generator_data_3.py" --output /tmp/quality-tool-generator/_quality_tool_generator_data_3.py
+      - name: Generate the repository
+        run: python /tmp/quality-tool-generator/quality_tool_generator.py --repo "${GITHUB_REPOSITORY#*/}" --output .
+      - name: Commit the generated source
+        run: |
+          rm --force .github/workflows/bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git add -- .gitignore .github/workflows/ci.yml README.md SKILL.md pyproject.toml src tests
+          git commit -m "[generated] Harden ${GITHUB_REPOSITORY#*/} for production"
+          git push origin HEAD:production-v1
