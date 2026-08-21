@@ -6,23 +6,35 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import collect_mutations, run_mutations, write_manifest
-
-DEFAULT_TEST_COMMAND = 'cargo llvm-cov --json --output-path target/coverage/coverage.json'
-DEFAULT_MANIFEST = Path("target/mutation/mutate4rust.json")
+from .core import (
+    MutationError,
+    collect_mutations,
+    detect_test_command,
+    detect_validation_command,
+    recover_active,
+    run_command,
+    run_mutations,
+    write_manifest,
+)
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description='Mutation testing for Rust projects')
+    value = argparse.ArgumentParser(description="Mutation testing for Rust source.")
     value.add_argument("filters", nargs="*", help="Only mutate source paths that contain one of these fragments.")
-    value.add_argument("--root", type=Path, default=Path("."), help="Project root.")
-    value.add_argument("--test-command", default=DEFAULT_TEST_COMMAND, help="Command run for the baseline and each mutant.")
-    value.add_argument("--timeout", type=float, default=60.0, help="Seconds allowed for each test run.")
-    value.add_argument("--max-mutants", type=int, default=None, help="Stop after this number of mutants.")
-    value.add_argument("--skip-baseline", action="store_true", help="Do not verify the unchanged source before mutation.")
-    value.add_argument("--list", action="store_true", dest="list_only", help="List mutation candidates without running tests.")
-    value.add_argument("--json", action="store_true", dest="json_output", help="Write JSON output.")
-    value.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST, help="Result manifest path.")
+    value.add_argument("--root", type=Path, default=Path("."))
+    value.add_argument("--test-command", help="Test command. Default: cargo test --quiet.")
+    value.add_argument("--validate-command", help="Build or type-check command. Default: cargo check --quiet.")
+    value.add_argument("--no-validate", action="store_true", help="Disable build validation.")
+    value.add_argument("--timeout", type=float, default=120.0, help="Timeout for each command in seconds.")
+    value.add_argument("--max-mutants", type=int)
+    value.add_argument("--list", action="store_true", help="List mutation sites without changing files.")
+    value.add_argument("--skip-baseline", action="store_true")
+    value.add_argument("--include-tests", action="store_true")
+    value.add_argument("--manifest", type=Path, default=Path("target/mutation/results.json"))
+    value.add_argument("--json", action="store_true", dest="json_output")
+    value.add_argument("--fail-on-survivors", action="store_true", default=True)
+    value.add_argument("--allow-survivors", action="store_false", dest="fail_on_survivors")
+    value.add_argument("--allow-compile-errors", action="store_true", help="Exclude compile-error mutants instead of failing the run.")
     value.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return value
 
@@ -31,29 +43,72 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root = args.root.resolve()
     try:
-        mutations = collect_mutations(root, args.filters)
-        if args.list_only:
-            rows = [mutation.public_dict() for mutation in mutations]
+        recover_active(root)
+        mutations = collect_mutations(root, args.filters, args.include_tests)
+        if args.list:
+            payload = {
+                "schema_version": 1,
+                "tool": "mutate4rust",
+                "version": __version__,
+                "summary": {"total": len(mutations)},
+                "mutants": [mutation.public_dict() for mutation in mutations],
+            }
             if args.json_output:
-                print(json.dumps(rows, indent=2, sort_keys=True))
+                print(json.dumps(payload, indent=2, sort_keys=True))
             else:
                 for mutation in mutations:
-                    print(f"{mutation.id:5d} {mutation.file}:{mutation.line}:{mutation.column} {mutation.original} -> {mutation.replacement}")
+                    print(f"{mutation.id}\t{mutation.file}:{mutation.line}:{mutation.column}\t{mutation.original} -> {mutation.replacement}")
             return 0
-        results = run_mutations(root, mutations, args.test_command, args.timeout, args.max_mutants, not args.skip_baseline)
+        if not mutations:
+            raise MutationError("no mutation sites were discovered")
+        test_command = args.test_command or detect_test_command(root)
+        if not test_command:
+            raise MutationError("--test-command is required because no project test command was detected")
+        validation_command = None if args.no_validate else (args.validate_command or detect_validation_command(root))
+        if not args.skip_baseline:
+            baseline = run_command(test_command, root, args.timeout)
+            if baseline.timed_out:
+                raise MutationError("baseline test command timed out")
+            if baseline.returncode != 0:
+                raise MutationError(f"baseline tests failed with exit code {baseline.returncode}")
+        results = run_mutations(root, mutations, test_command, args.timeout, validation_command, args.max_mutants)
         manifest = args.manifest if args.manifest.is_absolute() else root / args.manifest
-        write_manifest(manifest, results)
-    except (OSError, ValueError, RuntimeError) as error:
+        write_manifest(manifest, "mutate4rust", __version__, root, results)
+    except (OSError, ValueError, MutationError, json.JSONDecodeError) as error:
         print(f"mutate4rust: {error}", file=sys.stderr)
         return 1
 
+    infrastructure = [result for result in results if result.status in {"invalid", "timeout", "error"}]
+    compile_errors = [result for result in results if result.status == "compile-error"]
+    survivors = [result for result in results if result.status == "survived"]
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
     if args.json_output:
-        print(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True))
+        payload = {
+            "schema_version": 1,
+            "tool": "mutate4rust",
+            "version": __version__,
+            "root": root.as_posix(),
+            "summary": {"total": len(results), **counts},
+            "mutants": [result.to_dict() for result in results],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        for result in results:
+        print("Mutation Report")
+        print("===============")
+        print(f"Total: {len(results)}")
+        for status in sorted(counts):
+            print(f"{status}: {counts[status]}")
+        for result in survivors:
             mutation = result.mutation
-            print(f"{result.status.upper():8} {mutation.file}:{mutation.line}:{mutation.column} {mutation.original} -> {mutation.replacement}")
-        killed = sum(result.status == "killed" for result in results)
-        survived = sum(result.status == "survived" for result in results)
-        print(f"\nMutants: {len(results)}  Killed: {killed}  Survived: {survived}")
-    return 2 if any(result.status == "survived" for result in results) else 0
+            print(f"SURVIVED {mutation.file}:{mutation.line}:{mutation.column} {mutation.original} -> {mutation.replacement}")
+    if infrastructure or (compile_errors and not args.allow_compile_errors):
+        return 1
+    if survivors and args.fail_on_survivors:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
