@@ -11,12 +11,24 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install . pytest
-      - run: python -m pytest -q
+          cache: pip
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build
+      - name: Build wheel
+        run: python -m build
+      - name: Install wheel and tests
+        run: python -m pip install dist/*.whl pytest
+      - name: Unit and target-parser tests
+        run: python -m pytest -q
+      - name: CLI smoke tests
+        run: |
+          mutate4rust --version
+          mutate4rust --help
+      - name: Rust fixture syntax
+        run: rustc --crate-type lib tests/fixtures/sample.rs -o /tmp/libsample.rlib

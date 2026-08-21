@@ -1,24 +1,43 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import signal
 import subprocess
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
-LANGUAGE = 'rust'
-EXTENSIONS = tuple(['.rs'])
-EXCLUDED_DIRS = {".git", ".hg", ".idea", ".pytest_cache", ".tox", ".venv", "build", "coverage", "dist", "node_modules", "target", "vendor", "venv", ".build"}
+from tree_sitter_language_pack import get_parser
 
-REPLACEMENTS = {
-    "typescript": [(r"\btrue\b", "false"), (r"\bfalse\b", "true"), (r"!==", "==="), (r"===", "!=="), (r"!=", "=="), (r"==", "!="), (r"&&", "||"), (r"\|\|", "&&"), (r"<=", ">"), (r">=", "<"), (r"(?<![+])-", "+"), (r"\+", "-"), (r"\*", "/")],
-    "rust": [(r"\btrue\b", "false"), (r"\bfalse\b", "true"), (r"!=", "=="), (r"==", "!="), (r"&&", "||"), (r"\|\|", "&&"), (r"<=", ">"), (r">=", "<"), (r"(?<![+])-", "+"), (r"\+", "-"), (r"\*", "/")],
-    "swift": [(r"\btrue\b", "false"), (r"\bfalse\b", "true"), (r"!=", "=="), (r"==", "!="), (r"&&", "||"), (r"\|\|", "&&"), (r"<=", ">"), (r">=", "<"), (r"(?<![+])-", "+"), (r"\+", "-"), (r"\*", "/")],
-    "objective-c": [(r"\bYES\b", "NO"), (r"\bNO\b", "YES"), (r"\btrue\b", "false"), (r"\bfalse\b", "true"), (r"!=", "=="), (r"==", "!="), (r"&&", "||"), (r"\|\|", "&&"), (r"<=", ">"), (r">=", "<"), (r"(?<![+])-", "+"), (r"\+", "-"), (r"\*", "/")],
-    "bash": [(r"\btrue\b", "false"), (r"\bfalse\b", "true"), (r"&&", "||"), (r"\|\|", "&&"), (r"-eq\b", "-ne"), (r"-ne\b", "-eq"), (r"-lt\b", "-ge"), (r"-le\b", "-gt"), (r"-gt\b", "-le"), (r"-ge\b", "-lt"), (r"!=", "=="), (r"==", "!=")],
-}[LANGUAGE]
+LANGUAGE = "rust"
+EXTENSIONS = (".rs",)
+EXCLUDED_DIRS = frozenset((".git", ".hg", ".idea", ".pytest_cache", ".tox", ".venv", ".build", "build", "coverage", "dist", "node_modules", "target", "vendor", "venv", "DerivedData", "Pods"))
+TEST_DIRS = frozenset(("tests",))
+TEST_SUFFIXES = ("_test.rs",)
+JOURNAL_PATH = Path("target/mutation/active.json")
+
+SKIPPED_ANCESTORS = frozenset({
+    "comment", "line_comment", "block_comment", "string_literal", "raw_string_literal",
+    "char_literal", "heredoc_body", "heredoc_redirect", "string", "interpreted_string_literal",
+})
+BINARY_PARENTS = frozenset({
+    "binary_expression", "logical_expression", "boolean_expression", "test_expression",
+    "arithmetic_expression", "compound_expression", "comparison_expression",
+})
+COMMON_REPLACEMENTS = {
+    "==": "!=", "!=": "==", ">": "<=", "<": ">=", ">=": "<", "<=": ">",
+    "&&": "||", "||": "&&", "true": "false", "false": "true",
+}
+ARITHMETIC_REPLACEMENTS = {"+": "-", "-": "+", "*": "/", "/": "*"}
+
+
+class MutationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -40,31 +59,41 @@ class Mutation:
 
 
 @dataclass(frozen=True)
+class CommandResult:
+    returncode: int | None
+    timed_out: bool
+    duration_seconds: float
+    output: str
+
+
+@dataclass(frozen=True)
 class MutationResult:
     mutation: Mutation
     status: str
     exit_code: int | None
+    duration_seconds: float
+    detail: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {**self.mutation.public_dict(), "status": self.status, "exit_code": self.exit_code}
+        return {
+            **self.mutation.public_dict(),
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "duration_seconds": round(self.duration_seconds, 3),
+            "detail": self.detail,
+        }
 
 
-def _is_test(relative: str) -> bool:
-    lowered = relative.lower()
-    name = Path(relative).name.lower()
-    if LANGUAGE == "typescript":
-        return name.endswith((".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", ".d.ts")) or "/tests/" in f"/{lowered}/"
-    if LANGUAGE == "rust":
-        return "/tests/" in f"/{lowered}/" or name.endswith("_test.rs")
-    if LANGUAGE == "swift":
-        return "/tests/" in f"/{lowered}/" or name.endswith("tests.swift")
-    if LANGUAGE == "objective-c":
-        return "/tests/" in f"/{lowered}/" or name.endswith(("tests.m", "tests.mm", "test.m", "test.mm"))
-    return "/test/" in f"/{lowered}/" or "/tests/" in f"/{lowered}/" or name.endswith(".bats")
+def _is_test_path(relative: str) -> bool:
+    path = Path(relative)
+    lowered_test_dirs = {value.lower() for value in TEST_DIRS}
+    if any(part in TEST_DIRS or part.lower() in lowered_test_dirs for part in path.parts):
+        return True
+    return path.name.endswith(TEST_SUFFIXES)
 
 
-def discover_files(root: Path, filters: Sequence[str] = ()) -> list[Path]:
-    files: list[Path] = []
+def discover_files(root: Path, filters: Sequence[str] = (), include_tests: bool = False) -> list[Path]:
+    output: list[Path] = []
     for directory, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(name for name in dirnames if name not in EXCLUDED_DIRS)
         for filename in sorted(filenames):
@@ -72,127 +101,232 @@ def discover_files(root: Path, filters: Sequence[str] = ()) -> list[Path]:
                 continue
             path = Path(directory, filename)
             relative = path.relative_to(root).as_posix()
-            if _is_test(relative):
+            if not include_tests and _is_test_path(relative):
                 continue
             if filters and not any(fragment in relative for fragment in filters):
                 continue
-            files.append(path)
-    return files
+            output.append(path)
+    return output
 
 
-def mask_non_code(text: str) -> str:
-    out = list(text)
-    index = 0
-    state = "code"
-    quote = ""
-    while index < len(text):
-        char = text[index]
-        next_char = text[index + 1] if index + 1 < len(text) else ""
-        if state == "code":
-            if LANGUAGE == "bash" and char == "#":
-                state = "line"
-                out[index] = " "
-            elif LANGUAGE != "bash" and char == "/" and next_char == "/":
-                state = "line"
-                out[index] = out[index + 1] = " "
-                index += 1
-            elif LANGUAGE != "bash" and char == "/" and next_char == "*":
-                state = "block"
-                out[index] = out[index + 1] = " "
-                index += 1
-            elif char in {'"', "'", "`"} and (LANGUAGE == "typescript" or char != "`"): 
-                state = "string"
-                quote = char
-                out[index] = " "
-            else:
-                out[index] = char
-        elif state == "line":
-            if char == "\n":
-                state = "code"
-                out[index] = "\n"
-            else:
-                out[index] = " "
-        elif state == "block":
-            out[index] = "\n" if char == "\n" else " "
-            if char == "*" and next_char == "/":
-                out[index + 1] = " "
-                index += 1
-                state = "code"
-        else:
-            out[index] = "\n" if char == "\n" else " "
-            if char == "\\" and quote != "'" and index + 1 < len(text):
-                out[index + 1] = " "
-                index += 1
-            elif char == quote:
-                state = "code"
-        index += 1
-    return "".join(out)
+def _walk(node: Any) -> Iterator[Any]:
+    yield node
+    for child in node.children:
+        yield from _walk(child)
+
+
+def _node_text(node: Any, source: bytes) -> str:
+    return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+
+def _ancestor_types(node: Any) -> set[str]:
+    result: set[str] = set()
+    parent = getattr(node, "parent", None)
+    while parent is not None:
+        result.add(parent.type)
+        parent = getattr(parent, "parent", None)
+    return result
+
+
+def _point(node: Any) -> tuple[int, int]:
+    point = node.start_point
+    if hasattr(point, "row"):
+        return int(point.row) + 1, int(point.column) + 1
+    return int(point[0]) + 1, int(point[1]) + 1
+
+
+def _candidate(node: Any, source: bytes) -> str | None:
+    if node.children:
+        return None
+    if _ancestor_types(node) & SKIPPED_ANCESTORS:
+        return None
+    text = _node_text(node, source)
+    replacement = COMMON_REPLACEMENTS.get(text)
+    if replacement is not None:
+        return replacement
+    parent = getattr(node, "parent", None)
+    if text in ARITHMETIC_REPLACEMENTS and parent is not None and parent.type in BINARY_PARENTS:
+        return ARITHMETIC_REPLACEMENTS[text]
+    return None
+
+
+def parse_valid(source: bytes) -> bool:
+    return not get_parser(LANGUAGE).parse(source).root_node.has_error
 
 
 def enumerate_mutations(path: Path, root: Path, start_id: int = 1) -> list[Mutation]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    masked = mask_non_code(text)
-    candidates: list[tuple[int, int, str, str]] = []
-    for pattern, replacement in REPLACEMENTS:
-        for match in re.finditer(pattern, masked):
-            original = text[match.start() : match.end()]
-            if original == replacement:
-                continue
-            candidates.append((match.start(), match.end(), original, replacement))
-    candidates.sort(key=lambda value: (value[0], -(value[1] - value[0])))
-    selected: list[tuple[int, int, str, str]] = []
-    last_end = -1
-    for candidate in candidates:
-        if candidate[0] < last_end:
-            continue
-        selected.append(candidate)
-        last_end = candidate[1]
-    out: list[Mutation] = []
+    source = path.read_bytes()
+    tree = get_parser(LANGUAGE).parse(source)
+    if tree.root_node.has_error:
+        raise MutationError(f"source contains parse errors: {path}")
+    candidates: list[Mutation] = []
     relative = path.relative_to(root).as_posix()
-    for index, (start, end, original, replacement) in enumerate(selected, start_id):
-        line = text.count("\n", 0, start) + 1
-        line_start = text.rfind("\n", 0, start) + 1
-        out.append(Mutation(index, relative, line, start - line_start + 1, original, replacement, start, end))
-    return out
+    for node in _walk(tree.root_node):
+        replacement = _candidate(node, source)
+        if replacement is None:
+            continue
+        original = _node_text(node, source)
+        line, column = _point(node)
+        candidates.append(Mutation(0, relative, line, column, original, replacement, node.start_byte, node.end_byte))
+    candidates.sort(key=lambda item: (item.start, -(item.end - item.start), item.replacement))
+    selected: list[Mutation] = []
+    last_end = -1
+    for mutation in candidates:
+        if mutation.start < last_end:
+            continue
+        values = {key: value for key, value in asdict(mutation).items() if key != "id"}
+        selected.append(Mutation(start_id + len(selected), **values))
+        last_end = mutation.end
+    return selected
 
 
-def collect_mutations(root: Path, filters: Sequence[str] = ()) -> list[Mutation]:
-    out: list[Mutation] = []
-    for path in discover_files(root, filters):
-        out.extend(enumerate_mutations(path, root, len(out) + 1))
-    return out
+def collect_mutations(root: Path, filters: Sequence[str] = (), include_tests: bool = False) -> list[Mutation]:
+    output: list[Mutation] = []
+    for path in discover_files(root, filters, include_tests):
+        output.extend(enumerate_mutations(path, root, len(output) + 1))
+    return output
 
 
-def _run(command: str, root: Path, timeout_seconds: float) -> tuple[int | None, bool]:
+def run_command(command: str, root: Path, timeout_seconds: float) -> CommandResult:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=root,
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=(os.name != "nt"),
+    )
     try:
-        completed = subprocess.run(command, cwd=root, shell=True, check=False, timeout=timeout_seconds, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return completed.returncode, False
+        output, _ = process.communicate(timeout=timeout_seconds)
+        return CommandResult(process.returncode, False, time.monotonic() - started, output or "")
     except subprocess.TimeoutExpired:
-        return None, True
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        output, _ = process.communicate()
+        return CommandResult(None, True, time.monotonic() - started, output or "")
 
 
-def run_mutations(root: Path, mutations: Iterable[Mutation], test_command: str, timeout_seconds: float, max_mutants: int | None = None, run_baseline: bool = True) -> list[MutationResult]:
-    if run_baseline:
-        baseline, timed_out = _run(test_command, root, timeout_seconds)
-        if timed_out or baseline != 0:
-            raise RuntimeError("baseline tests did not pass")
+def _atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(temporary_name, mode)
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def recover_active(root: Path) -> bool:
+    journal = root / JOURNAL_PATH
+    if not journal.exists():
+        return False
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    path = root / str(payload["file"])
+    original = base64.b64decode(str(payload["content"]))
+    mode = int(payload.get("mode", 0o644))
+    _atomic_write(path, original, mode)
+    journal.unlink(missing_ok=True)
+    return True
+
+
+class SourceMutation:
+    def __init__(self, root: Path, mutation: Mutation):
+        self.root = root
+        self.mutation = mutation
+        self.path = root / mutation.file
+        self.original = self.path.read_bytes()
+        self.mode = self.path.stat().st_mode
+        self.journal = root / JOURNAL_PATH
+
+    def __enter__(self) -> Path:
+        self.journal.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "file": self.mutation.file,
+            "content": base64.b64encode(self.original).decode("ascii"),
+            "mode": self.mode,
+        }
+        _atomic_write(self.journal, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"), 0o600)
+        mutated = self.original[:self.mutation.start] + self.mutation.replacement.encode() + self.original[self.mutation.end:]
+        _atomic_write(self.path, mutated, self.mode)
+        return self.path
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        _atomic_write(self.path, self.original, self.mode)
+        self.journal.unlink(missing_ok=True)
+
+
+def detect_test_command(root: Path) -> str | None:
+    return "cargo test --quiet" if (root / "Cargo.toml").exists() else None
+
+
+def detect_validation_command(root: Path) -> str | None:
+    return "cargo check --quiet" if (root / "Cargo.toml").exists() else None
+
+
+def run_mutations(
+    root: Path,
+    mutations: Iterable[Mutation],
+    test_command: str,
+    timeout_seconds: float,
+    validation_command: str | None,
+    max_mutants: int | None = None,
+) -> list[MutationResult]:
+    recover_active(root)
     results: list[MutationResult] = []
     for mutation in mutations:
         if max_mutants is not None and len(results) >= max_mutants:
             break
-        path = root / mutation.file
-        original_text = path.read_text(encoding="utf-8", errors="replace")
-        mutated = original_text[: mutation.start] + mutation.replacement + original_text[mutation.end :]
-        path.write_text(mutated, encoding="utf-8")
-        try:
-            exit_code, timed_out = _run(test_command, root, timeout_seconds)
-            status = "killed" if timed_out or exit_code != 0 else "survived"
-        finally:
-            path.write_text(original_text, encoding="utf-8")
-        results.append(MutationResult(mutation, status, exit_code))
+        with SourceMutation(root, mutation) as path:
+            mutated = path.read_bytes()
+            if not parse_valid(mutated):
+                results.append(MutationResult(mutation, "invalid", None, 0.0, "mutated source does not parse"))
+                continue
+            if validation_command:
+                validation = run_command(validation_command, root, timeout_seconds)
+                if validation.timed_out:
+                    results.append(MutationResult(mutation, "timeout", None, validation.duration_seconds, "validation timed out"))
+                    continue
+                if validation.returncode != 0:
+                    results.append(MutationResult(mutation, "compile-error", validation.returncode, validation.duration_seconds, validation.output[-2000:]))
+                    continue
+            execution = run_command(test_command, root, timeout_seconds)
+            if execution.timed_out:
+                status = "timeout"
+                detail = "test command timed out"
+            elif execution.returncode == 0:
+                status = "survived"
+                detail = None
+            else:
+                status = "killed"
+                detail = None
+            results.append(MutationResult(mutation, status, execution.returncode, execution.duration_seconds, detail))
     return results
 
 
-def write_manifest(path: Path, results: Iterable[MutationResult]) -> None:
+def write_manifest(path: Path, tool: str, version: str, root: Path, results: Sequence[MutationResult]) -> None:
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+    payload = {
+        "schema_version": 1,
+        "tool": tool,
+        "version": version,
+        "root": root.as_posix(),
+        "summary": {"total": len(results), **counts},
+        "mutants": [result.to_dict() for result in results],
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), 0o644)
