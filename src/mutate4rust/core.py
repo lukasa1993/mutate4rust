@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -14,25 +15,37 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from tree_sitter_language_pack import get_parser
 
-LANGUAGE = "rust"
-EXTENSIONS = (".rs",)
-EXCLUDED_DIRS = frozenset((".git", ".hg", ".idea", ".pytest_cache", ".tox", ".venv", ".build", "build", "coverage", "dist", "node_modules", "target", "vendor", "venv", "DerivedData", "Pods"))
-TEST_DIRS = frozenset(("tests",))
-TEST_SUFFIXES = ("_test.rs",)
+LANGUAGE = 'rust'
+PARSER_BY_EXTENSION = {}
+DISPLAY_LANGUAGE = 'Rust'
+EXTENSIONS = ('.rs',)
+EXCLUDED_DIRS = frozenset(('.git', '.hg', '.idea', '.pytest_cache', '.tox', '.venv', '.build', 'build', 'coverage', 'dist', 'node_modules', 'target', 'vendor', 'venv', 'DerivedData', 'Pods'))
+TEST_DIRS = frozenset(('tests',))
+TEST_SUFFIXES = ('_test.rs',)
 JOURNAL_PATH = Path("target/mutation/active.json")
 
 SKIPPED_ANCESTORS = frozenset({
     "comment", "line_comment", "block_comment", "string_literal", "raw_string_literal",
-    "char_literal", "heredoc_body", "heredoc_redirect", "string", "interpreted_string_literal",
+    "char_literal", "heredoc_body", "heredoc_redirect", "word", "string", "interpreted_string_literal",
 })
 BINARY_PARENTS = frozenset({
     "binary_expression", "logical_expression", "boolean_expression", "test_expression",
-    "arithmetic_expression", "compound_expression", "comparison_expression",
+    "arithmetic_expression", "compound_expression", "comparison_expression", "binary_operator", "boolean_operator",
 })
 COMMON_REPLACEMENTS = {
     "==": "!=", "!=": "==", ">": "<=", "<": ">=", ">=": "<", "<=": ">",
     "&&": "||", "||": "&&", "true": "false", "false": "true",
 }
+LANGUAGE_REPLACEMENTS = {
+    "typescript": {},
+    "python": {"True": "False", "False": "True", "and": "or", "or": "and"},
+    "rust": {},
+    "swift": {},
+    "objc": {"YES": "NO", "NO": "YES"},
+    "bash": {"-eq": "-ne", "-ne": "-eq", "-gt": "-le", "-ge": "-lt", "-lt": "-ge", "-le": "-gt"},
+    "c": {},
+    "cpp": {},
+}[LANGUAGE]
 ARITHMETIC_REPLACEMENTS = {"+": "-", "-": "+", "*": "/", "/": "*"}
 
 
@@ -75,19 +88,13 @@ class MutationResult:
     detail: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            **self.mutation.public_dict(),
-            "status": self.status,
-            "exit_code": self.exit_code,
-            "duration_seconds": round(self.duration_seconds, 3),
-            "detail": self.detail,
-        }
+        return {**self.mutation.public_dict(), "status": self.status, "exit_code": self.exit_code,
+                "duration_seconds": round(self.duration_seconds, 3), "detail": self.detail}
 
 
 def _is_test_path(relative: str) -> bool:
     path = Path(relative)
-    lowered_test_dirs = {value.lower() for value in TEST_DIRS}
-    if any(part in TEST_DIRS or part.lower() in lowered_test_dirs for part in path.parts):
+    if any(part in TEST_DIRS or part.lower() in {value.lower() for value in TEST_DIRS} for part in path.parts):
         return True
     return path.name.endswith(TEST_SUFFIXES)
 
@@ -116,7 +123,7 @@ def _walk(node: Any) -> Iterator[Any]:
 
 
 def _node_text(node: Any, source: bytes) -> str:
-    return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
 def _ancestor_types(node: Any) -> set[str]:
@@ -141,7 +148,7 @@ def _candidate(node: Any, source: bytes) -> str | None:
     if _ancestor_types(node) & SKIPPED_ANCESTORS:
         return None
     text = _node_text(node, source)
-    replacement = COMMON_REPLACEMENTS.get(text)
+    replacement = LANGUAGE_REPLACEMENTS.get(text, COMMON_REPLACEMENTS.get(text))
     if replacement is not None:
         return replacement
     parent = getattr(node, "parent", None)
@@ -150,13 +157,17 @@ def _candidate(node: Any, source: bytes) -> str | None:
     return None
 
 
-def parse_valid(source: bytes) -> bool:
-    return not get_parser(LANGUAGE).parse(source).root_node.has_error
+def parser_for_path(path: Path) -> Any:
+    return get_parser(PARSER_BY_EXTENSION.get(path.suffix.lower(), LANGUAGE))
+
+
+def parse_valid(source: bytes, path: Path) -> bool:
+    return not parser_for_path(path).parse(source).root_node.has_error
 
 
 def enumerate_mutations(path: Path, root: Path, start_id: int = 1) -> list[Mutation]:
     source = path.read_bytes()
-    tree = get_parser(LANGUAGE).parse(source)
+    tree = parser_for_path(path).parse(source)
     if tree.root_node.has_error:
         raise MutationError(f"source contains parse errors: {path}")
     candidates: list[Mutation] = []
@@ -174,8 +185,7 @@ def enumerate_mutations(path: Path, root: Path, start_id: int = 1) -> list[Mutat
     for mutation in candidates:
         if mutation.start < last_end:
             continue
-        values = {key: value for key, value in asdict(mutation).items() if key != "id"}
-        selected.append(Mutation(start_id + len(selected), **values))
+        selected.append(Mutation(start_id + len(selected), **{key: value for key, value in asdict(mutation).items() if key != "id"}))
         last_end = mutation.end
     return selected
 
@@ -215,18 +225,18 @@ def run_command(command: str, root: Path, timeout_seconds: float) -> CommandResu
 
 def _atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         if mode is not None:
-            os.chmod(temporary_name, mode)
-        os.replace(temporary_name, path)
+            os.chmod(name, mode)
+        os.replace(name, path)
     finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+        if os.path.exists(name):
+            os.unlink(name)
 
 
 def recover_active(root: Path) -> bool:
@@ -253,13 +263,9 @@ class SourceMutation:
 
     def __enter__(self) -> Path:
         self.journal.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "file": self.mutation.file,
-            "content": base64.b64encode(self.original).decode("ascii"),
-            "mode": self.mode,
-        }
+        payload = {"file": self.mutation.file, "content": base64.b64encode(self.original).decode("ascii"), "mode": self.mode}
         _atomic_write(self.journal, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"), 0o600)
-        mutated = self.original[:self.mutation.start] + self.mutation.replacement.encode() + self.original[self.mutation.end:]
+        mutated = self.original[: self.mutation.start] + self.mutation.replacement.encode() + self.original[self.mutation.end :]
         _atomic_write(self.path, mutated, self.mode)
         return self.path
 
@@ -269,11 +275,40 @@ class SourceMutation:
 
 
 def detect_test_command(root: Path) -> str | None:
-    return "cargo test --quiet" if (root / "Cargo.toml").exists() else None
+    configured = 'cargo test --quiet'
+    if configured:
+        return configured
+    if (root / "build" / "CTestTestfile.cmake").exists():
+        return "ctest --test-dir build --output-on-failure"
+    makefile = root / "Makefile"
+    if makefile.exists() and re.search(r"(?m)^test\s*:", makefile.read_text(encoding="utf-8", errors="ignore")):
+        return "make test"
+    return None
 
 
 def detect_validation_command(root: Path) -> str | None:
-    return "cargo check --quiet" if (root / "Cargo.toml").exists() else None
+    configured = 'cargo check --quiet'
+    if configured:
+        return configured
+    if (root / "build" / "build.ninja").exists():
+        return "ninja -C build"
+    if (root / "build" / "CMakeCache.txt").exists():
+        return "cmake --build build"
+    if (root / "Makefile").exists():
+        return "make -s"
+    return None
+
+
+def _bash_validate(path: Path, root: Path, timeout_seconds: float) -> CommandResult | None:
+    if LANGUAGE != "bash":
+        return None
+    relative = path.relative_to(root).as_posix()
+    return run_command(f"bash -n {shlex_quote(relative)}", root, timeout_seconds)
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+    return shlex.quote(value)
 
 
 def run_mutations(
@@ -291,11 +326,13 @@ def run_mutations(
             break
         with SourceMutation(root, mutation) as path:
             mutated = path.read_bytes()
-            if not parse_valid(mutated):
+            if not parse_valid(mutated, path):
                 results.append(MutationResult(mutation, "invalid", None, 0.0, "mutated source does not parse"))
                 continue
-            if validation_command:
+            validation = _bash_validate(path, root, timeout_seconds)
+            if validation is None and validation_command:
                 validation = run_command(validation_command, root, timeout_seconds)
+            if validation is not None:
                 if validation.timed_out:
                     results.append(MutationResult(mutation, "timeout", None, validation.duration_seconds, "validation timed out"))
                     continue

@@ -4,10 +4,10 @@
 
 ```bash
 pipx install git+https://github.com/lukasa1993/mutate4rust.git
-mutate4rust --test-command "cargo test --quiet" --validate-command "cargo check --quiet"
+mutate4rust --test-command "<project test command>" --validate-command "<project build command>"
 ```
 
-A timeout, an invalid mutant, or a compile error is not a killed mutant. These states return exit status `1`. A surviving mutant returns exit status `2` by default.
+Compiled C-family projects require a detected or explicit validation command. Timeouts, invalid syntax, and compile errors return status `1`; surviving mutants return status `2`.
 
 ## Development
 

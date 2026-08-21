@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mutate4rust"
 version = "1.0.0"
-description = "Syntax-aware mutation testing for Rust projects"
+description = 'Syntax-aware mutation testing for Rust projects'
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

@@ -1,9 +1,9 @@
 # mutate4rust
 
-Use `mutate4rust` for Rust mutation verification.
+Use `mutate4rust` for MUTATE verification of Rust projects.
 
 1. Run `mutate4rust --help` before first use.
-2. Use the complete project test command.
-3. Keep build validation enabled.
-4. Treat exit `1` as a test, timeout, parse, validation, or restoration failure. Do not report it as a quality pass.
-5. Treat exit `2` as surviving-mutant failure.
+2. Use the project test/build commands that create current coverage or execute the full unit suite.
+3. Run the gate with `--fail-on-survivors`.
+4. Treat exit `1` as an infrastructure or configuration failure. Do not report it as a quality pass.
+5. Treat exit `2` as a quality-gate failure.
