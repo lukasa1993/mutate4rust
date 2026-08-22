@@ -90,6 +90,25 @@ fn summary(results: &[MutationResult]) -> Summary {
     value
 }
 
+fn require_successful_baseline(
+    label: &str,
+    command: &str,
+    root: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    let result = run_shell(command, root, timeout)?;
+    if result.timed_out {
+        return Err(Error::Mutation(format!("baseline {label} command timed out")));
+    }
+    if result.exit_code != Some(0) {
+        return Err(Error::Mutation(format!(
+            "baseline {label} failed with exit code {:?}",
+            result.exit_code
+        )));
+    }
+    Ok(())
+}
+
 fn run() -> Result<u8, Error> {
     let args = Args::parse();
     let root = args.root.canonicalize()?;
@@ -112,23 +131,17 @@ fn run() -> Result<u8, Error> {
         return Err(Error::Mutation("no mutation sites were discovered".into()));
     }
     let timeout = Duration::from_secs(args.timeout);
-    if !args.skip_baseline {
-        let baseline = run_shell(&args.test_command, &root, timeout)?;
-        if baseline.timed_out {
-            return Err(Error::Mutation("baseline test command timed out".into()));
-        }
-        if baseline.exit_code != Some(0) {
-            return Err(Error::Mutation(format!(
-                "baseline tests failed with exit code {:?}",
-                baseline.exit_code
-            )));
-        }
-    }
     let validate = if args.no_validate {
         None
     } else {
         Some(args.validate_command.as_str())
     };
+    if !args.skip_baseline {
+        if let Some(command) = validate {
+            require_successful_baseline("validation", command, &root, timeout)?;
+        }
+        require_successful_baseline("test", &args.test_command, &root, timeout)?;
+    }
     let results = run_mutations(
         &root,
         &mutations,
