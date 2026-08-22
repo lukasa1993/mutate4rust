@@ -1,17 +1,23 @@
 # mutate4rust
 
-`mutate4rust` performs syntax-aware mutation testing for Rust. It verifies the baseline, restores source through a crash-recovery journal, separates timeouts and compile errors from killed mutants, and writes a versioned JSON manifest.
+Native Rust mutation testing. The executable is written in Rust and uses the Rust syntax tree to mutate executable expressions only.
+
+## Install
 
 ```bash
-pipx install git+https://github.com/lukasa1993/mutate4rust.git
-mutate4rust --test-command "<project test command>" --validate-command "<project build command>"
+cargo install --git https://github.com/lukasa1993/mutate4rust --force
 ```
 
-Compiled C-family projects require a detected or explicit validation command. Timeouts, invalid syntax, and compile errors return status `1`; surviving mutants return status `2`.
-
-## Development
+## Run
 
 ```bash
-python -m pip install -e . pytest
-pytest -q
+mutate4rust \
+  --test-command "cargo test --workspace --all-features" \
+  --validate-command "cargo check --workspace --all-targets --all-features"
 ```
+
+The tool runs the baseline first, validates each mutant, restores source with a crash-recovery journal, and keeps `killed`, `survived`, `timeout`, `invalid`, and `compile-error` separate.
+
+Exit status: `0` pass, `1` infrastructure/invalid/compile-error failure, `2` surviving mutants.
+
+No Python, Node, JVM, or other language runtime is required.
