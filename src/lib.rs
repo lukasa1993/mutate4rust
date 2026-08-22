@@ -1,14 +1,15 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{BinOp, ExprBinary, ExprLit, Lit};
+use syn::{Attribute, BinOp, ExprBinary, ExprLit, Item, Lit};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 use walkdir::{DirEntry, WalkDir};
@@ -96,6 +97,21 @@ fn is_test_path(path: &Path, root: &Path) -> bool {
             .is_some_and(|name| name.ends_with("_test.rs"))
 }
 
+fn is_auxiliary_path(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.file_name().and_then(|name| name.to_str()) == Some("build.rs") {
+        return true;
+    }
+    relative.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("examples" | "benches" | "fuzz")
+        )
+    })
+}
+
 pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> Vec<PathBuf> {
     let mut files: Vec<_> = WalkDir::new(root)
         .into_iter()
@@ -104,6 +120,7 @@ pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> V
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+        .filter(|path| !is_auxiliary_path(path, root))
         .filter(|path| include_tests || !is_test_path(path, root))
         .filter(|path| {
             if filters.is_empty() {
@@ -116,6 +133,164 @@ pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> V
         .collect();
     files.sort();
     files
+}
+
+#[derive(Clone, Copy)]
+struct CfgPossibility {
+    can_be_true_without_test: bool,
+    can_be_false_without_test: bool,
+}
+
+impl CfgPossibility {
+    const UNKNOWN: Self = Self {
+        can_be_true_without_test: true,
+        can_be_false_without_test: true,
+    };
+}
+
+fn split_cfg_arguments(stream: TokenStream) -> Vec<TokenStream> {
+    let mut output = Vec::new();
+    let mut current = TokenStream::new();
+    for token in stream {
+        let separator = matches!(&token, TokenTree::Punct(value) if value.as_char() == ',');
+        if separator {
+            if !current.is_empty() {
+                output.push(current);
+                current = TokenStream::new();
+            }
+        } else {
+            current.extend(std::iter::once(token));
+        }
+    }
+    if !current.is_empty() {
+        output.push(current);
+    }
+    output
+}
+
+fn cfg_possibility(stream: TokenStream) -> CfgPossibility {
+    let tokens: Vec<_> = stream.into_iter().collect();
+    if tokens.len() == 1 {
+        return match &tokens[0] {
+            TokenTree::Ident(value) if value == "test" => CfgPossibility {
+                can_be_true_without_test: false,
+                can_be_false_without_test: true,
+            },
+            TokenTree::Group(group) => cfg_possibility(group.stream()),
+            _ => CfgPossibility::UNKNOWN,
+        };
+    }
+    if tokens.len() != 2 {
+        return CfgPossibility::UNKNOWN;
+    }
+    let (TokenTree::Ident(operation), TokenTree::Group(group)) = (&tokens[0], &tokens[1]) else {
+        return CfgPossibility::UNKNOWN;
+    };
+    let arguments = split_cfg_arguments(group.stream());
+    let possibilities: Vec<_> = arguments.into_iter().map(cfg_possibility).collect();
+    match operation.to_string().as_str() {
+        "all" => CfgPossibility {
+            can_be_true_without_test: possibilities
+                .iter()
+                .all(|value| value.can_be_true_without_test),
+            can_be_false_without_test: possibilities
+                .iter()
+                .any(|value| value.can_be_false_without_test),
+        },
+        "any" => CfgPossibility {
+            can_be_true_without_test: possibilities
+                .iter()
+                .any(|value| value.can_be_true_without_test),
+            can_be_false_without_test: possibilities
+                .iter()
+                .all(|value| value.can_be_false_without_test),
+        },
+        "not" if possibilities.len() == 1 => CfgPossibility {
+            can_be_true_without_test: possibilities[0].can_be_false_without_test,
+            can_be_false_without_test: possibilities[0].can_be_true_without_test,
+        },
+        _ => CfgPossibility::UNKNOWN,
+    }
+}
+
+fn attrs_are_test_only(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if attribute.path().is_ident("test") {
+            return true;
+        }
+        match &attribute.meta {
+            syn::Meta::List(list) if list.path.is_ident("cfg") => {
+                !cfg_possibility(list.tokens.clone()).can_be_true_without_test
+            }
+            _ => false,
+        }
+    })
+}
+
+fn item_attrs(item: &Item) -> &[Attribute] {
+    match item {
+        Item::Const(value) => &value.attrs,
+        Item::Enum(value) => &value.attrs,
+        Item::ExternCrate(value) => &value.attrs,
+        Item::Fn(value) => &value.attrs,
+        Item::ForeignMod(value) => &value.attrs,
+        Item::Impl(value) => &value.attrs,
+        Item::Macro(value) => &value.attrs,
+        Item::Mod(value) => &value.attrs,
+        Item::Static(value) => &value.attrs,
+        Item::Struct(value) => &value.attrs,
+        Item::Trait(value) => &value.attrs,
+        Item::TraitAlias(value) => &value.attrs,
+        Item::Type(value) => &value.attrs,
+        Item::Union(value) => &value.attrs,
+        Item::Use(value) => &value.attrs,
+        _ => &[],
+    }
+}
+
+fn collect_test_only_ranges(items: &[Item], output: &mut Vec<Range<usize>>) {
+    for item in items {
+        if attrs_are_test_only(item_attrs(item)) {
+            output.push(item.span().byte_range());
+            continue;
+        }
+        match item {
+            Item::Mod(module) => {
+                if let Some((_, nested)) = &module.content {
+                    collect_test_only_ranges(nested, output);
+                }
+            }
+            Item::Impl(implementation) => {
+                for member in &implementation.items {
+                    let attrs = match member {
+                        syn::ImplItem::Const(value) => &value.attrs[..],
+                        syn::ImplItem::Fn(value) => &value.attrs[..],
+                        syn::ImplItem::Type(value) => &value.attrs[..],
+                        syn::ImplItem::Macro(value) => &value.attrs[..],
+                        _ => &[],
+                    };
+                    if attrs_are_test_only(attrs) {
+                        output.push(member.span().byte_range());
+                    }
+                }
+            }
+            Item::Trait(trait_item) => {
+                for member in &trait_item.items {
+                    let attrs = match member {
+                        syn::TraitItem::Const(value) => &value.attrs[..],
+                        syn::TraitItem::Fn(value) => &value.attrs[..],
+                        syn::TraitItem::Type(value) => &value.attrs[..],
+                        syn::TraitItem::Macro(value) => &value.attrs[..],
+                        _ => &[],
+                    };
+                    if attrs_are_test_only(attrs) {
+                        output.push(member.span().byte_range());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn replacement_for_binop(op: &BinOp) -> Option<&'static str> {
@@ -145,12 +320,20 @@ fn line_col(span: Span) -> (usize, usize) {
 struct MutationVisitor<'a> {
     source: &'a str,
     file: &'a str,
+    excluded_ranges: &'a [Range<usize>],
     candidates: Vec<Mutation>,
 }
 
 impl MutationVisitor<'_> {
     fn add_span(&mut self, span: Span, replacement: &str) {
         let range = span.byte_range();
+        if self
+            .excluded_ranges
+            .iter()
+            .any(|excluded| excluded.start <= range.start && range.end <= excluded.end)
+        {
+            return;
+        }
         let Some(original) = self.source.get(range.clone()) else {
             return;
         };
@@ -178,6 +361,7 @@ impl<'ast> Visit<'ast> for MutationVisitor<'_> {
         }
         visit::visit_expr_binary(self, node);
     }
+
     fn visit_expr_lit(&mut self, node: &'ast ExprLit) {
         if let Lit::Bool(value) = &node.lit {
             self.add_span(value.span(), if value.value { "false" } else { "true" });
@@ -186,10 +370,11 @@ impl<'ast> Visit<'ast> for MutationVisitor<'_> {
     }
 }
 
-pub fn enumerate_mutations(
+fn enumerate_mutations_with_tests(
     path: &Path,
     root: &Path,
     start_id: usize,
+    include_tests: bool,
 ) -> Result<Vec<Mutation>, Error> {
     let source = fs::read_to_string(path)?;
     let syntax = syn::parse_file(&source).map_err(|source_error| Error::Parse {
@@ -201,9 +386,14 @@ pub fn enumerate_mutations(
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
+    let mut excluded_ranges = Vec::new();
+    if !include_tests {
+        collect_test_only_ranges(&syntax.items, &mut excluded_ranges);
+    }
     let mut visitor = MutationVisitor {
         source: &source,
         file: &file,
+        excluded_ranges: &excluded_ranges,
         candidates: Vec::new(),
     };
     visitor.visit_file(&syntax);
@@ -219,6 +409,14 @@ pub fn enumerate_mutations(
     Ok(visitor.candidates)
 }
 
+pub fn enumerate_mutations(
+    path: &Path,
+    root: &Path,
+    start_id: usize,
+) -> Result<Vec<Mutation>, Error> {
+    enumerate_mutations_with_tests(path, root, start_id, false)
+}
+
 pub fn collect_mutations(
     root: &Path,
     include_tests: bool,
@@ -227,41 +425,79 @@ pub fn collect_mutations(
     let mut mutations = Vec::new();
     for path in discover_files(root, include_tests, filters) {
         let next = mutations.len() + 1;
-        mutations.extend(enumerate_mutations(&path, root, next)?);
+        mutations.extend(enumerate_mutations_with_tests(
+            &path,
+            root,
+            next,
+            include_tests,
+        )?);
     }
     Ok(mutations)
 }
 
+fn spawn_shell(command: &str, root: &Path) -> Result<Child, std::io::Error> {
+    #[cfg(windows)]
+    let mut shell = {
+        let mut value = Command::new("cmd");
+        value.args(["/C", command]);
+        value
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut value = Command::new("sh");
+        value.args(["-c", command]);
+        value
+    };
+    shell
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        shell.process_group(0);
+    }
+    shell.spawn()
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(group) = i32::try_from(child.id()) {
+        // The child starts a new process group, so killing the group also stops
+        // Cargo/rustc/test descendants before the source guard restores files.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<CommandResult, Error> {
     let started = Instant::now();
-    #[cfg(windows)]
-    let mut child = Command::new("cmd")
-        .args(["/C", command])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    #[cfg(not(windows))]
-    let mut child = Command::new("sh")
-        .args(["-c", command])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn_shell(command, root)?;
     let status = child.wait_timeout(timeout)?;
-    if status.is_none() {
-        let _ = child.kill();
+    let timed_out = status.is_none();
+    if timed_out {
+        terminate_process_tree(&mut child);
     }
     let output = child.wait_with_output()?;
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(CommandResult {
-        exit_code: if status.is_none() {
+        exit_code: if timed_out {
             None
         } else {
             output.status.code()
         },
-        timed_out: status.is_none(),
+        timed_out,
         duration: started.elapsed(),
         output: combined,
     })
@@ -433,6 +669,53 @@ mod tests {
     }
 
     #[test]
+    fn inline_test_modules_are_not_mutated_by_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        fs::write(
+            &path,
+            "fn production(a: bool, b: bool) -> bool { a && b }\n#[cfg(test)]\nmod tests {\n #[test]\n fn test_logic() { assert!(true && false); }\n}\n",
+        )
+        .unwrap();
+        let mutations = enumerate_mutations(&path, dir.path(), 1).unwrap();
+        assert_eq!(
+            mutations
+                .iter()
+                .filter(|item| item.original == "&&")
+                .count(),
+            1
+        );
+        assert!(!mutations
+            .iter()
+            .any(|item| matches!(item.original.as_str(), "true" | "false")));
+    }
+
+    #[test]
+    fn cfg_not_test_code_is_still_mutated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        fs::write(
+            &path,
+            "#[cfg(not(test))]\nfn production() -> bool { true }\n",
+        )
+        .unwrap();
+        let mutations = enumerate_mutations(&path, dir.path(), 1).unwrap();
+        assert!(mutations.iter().any(|item| item.original == "true"));
+    }
+
+    #[test]
+    fn discovery_excludes_build_scripts_and_auxiliary_targets() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("examples")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn production() {}\n").unwrap();
+        fs::write(dir.path().join("build.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("examples/demo.rs"), "fn main() {}\n").unwrap();
+        let files = discover_files(dir.path(), false, &[]);
+        assert_eq!(files, vec![dir.path().join("src/lib.rs")]);
+    }
+
+    #[test]
     fn source_guard_restores_source() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sample.rs");
@@ -453,5 +736,17 @@ mod tests {
         let result = run_shell("sleep 1", dir.path(), Duration::from_millis(20)).unwrap();
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_descendant_processes() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("leaked.txt");
+        let command = "(sleep 0.2; printf leaked > leaked.txt) & wait";
+        let result = run_shell(command, dir.path(), Duration::from_millis(20)).unwrap();
+        assert!(result.timed_out);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(!marker.exists());
     }
 }
