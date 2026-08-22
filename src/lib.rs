@@ -492,7 +492,11 @@ pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<Comman
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(CommandResult {
-        exit_code: if timed_out { None } else { output.status.code() },
+        exit_code: if timed_out {
+            None
+        } else {
+            output.status.code()
+        },
         timed_out,
         duration: started.elapsed(),
         output: combined,

@@ -98,7 +98,9 @@ fn require_successful_baseline(
 ) -> Result<(), Error> {
     let result = run_shell(command, root, timeout)?;
     if result.timed_out {
-        return Err(Error::Mutation(format!("baseline {label} command timed out")));
+        return Err(Error::Mutation(format!(
+            "baseline {label} command timed out"
+        )));
     }
     if result.exit_code != Some(0) {
         return Err(Error::Mutation(format!(
