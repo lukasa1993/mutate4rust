@@ -11,24 +11,22 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install build tools
-        run: python -m pip install --upgrade pip build
-      - name: Build wheel
-        run: python -m build
-      - name: Install wheel and tests
-        run: python -m pip install dist/*.whl pytest
-      - name: Unit and target-parser tests
-        run: python -m pytest -q
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --all-features
+      - name: Build release binary
+        run: cargo build --release
       - name: CLI smoke tests
         run: |
-          mutate4rust --version
-          mutate4rust --help
-      - name: Rust fixture syntax
-        run: rustc --crate-type lib tests/fixtures/sample.rs -o /tmp/libsample.rlib
+          ./target/release/mutate4rust --version
+          ./target/release/mutate4rust --help
