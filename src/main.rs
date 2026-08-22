@@ -1,5 +1,8 @@
 use clap::Parser;
-use mutate4rust::{collect_mutations, recover_active, run_mutations, run_shell, Error, MutationResult, Status, VERSION};
+use mutate4rust::{
+    collect_mutations, recover_active, run_mutations, run_shell, Error, MutationResult, Status,
+    VERSION,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,17 +46,46 @@ struct Args {
 }
 
 #[derive(Serialize)]
-struct Report<'a> { schema_version: u8, tool: &'static str, version: &'static str, root: String, summary: Summary, mutants: &'a [MutationResult] }
+struct Report<'a> {
+    schema_version: u8,
+    tool: &'static str,
+    version: &'static str,
+    root: String,
+    summary: Summary,
+    mutants: &'a [MutationResult],
+}
 
 #[derive(Serialize, Default)]
-struct Summary { total: usize, killed: usize, survived: usize, timeout: usize, invalid: usize, compile_error: usize }
+struct Summary {
+    total: usize,
+    killed: usize,
+    survived: usize,
+    timeout: usize,
+    invalid: usize,
+    compile_error: usize,
+}
 
-fn resolve(root: &Path, path: &Path) -> PathBuf { if path.is_absolute() { path.to_path_buf() } else { root.join(path) } }
+fn resolve(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
 
 fn summary(results: &[MutationResult]) -> Summary {
-    let mut value = Summary { total: results.len(), ..Summary::default() };
+    let mut value = Summary {
+        total: results.len(),
+        ..Summary::default()
+    };
     for result in results {
-        match result.status { Status::Killed => value.killed += 1, Status::Survived => value.survived += 1, Status::Timeout => value.timeout += 1, Status::Invalid => value.invalid += 1, Status::CompileError => value.compile_error += 1 }
+        match result.status {
+            Status::Killed => value.killed += 1,
+            Status::Survived => value.survived += 1,
+            Status::Timeout => value.timeout += 1,
+            Status::Invalid => value.invalid += 1,
+            Status::CompileError => value.compile_error += 1,
+        }
     }
     value
 }
@@ -64,36 +96,104 @@ fn run() -> Result<u8, Error> {
     recover_active(&root)?;
     let mutations = collect_mutations(&root, args.include_tests, &args.filters)?;
     if args.list {
-        if args.json { println!("{}", serde_json::to_string_pretty(&mutations)?); }
-        else { for item in &mutations { println!("{}\t{}:{}:{}\t{} -> {}", item.id, item.file, item.line, item.column, item.original, item.replacement); } }
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&mutations)?);
+        } else {
+            for item in &mutations {
+                println!(
+                    "{}\t{}:{}:{}\t{} -> {}",
+                    item.id, item.file, item.line, item.column, item.original, item.replacement
+                );
+            }
+        }
         return Ok(0);
     }
-    if mutations.is_empty() { return Err(Error::Mutation("no mutation sites were discovered".into())); }
+    if mutations.is_empty() {
+        return Err(Error::Mutation("no mutation sites were discovered".into()));
+    }
     let timeout = Duration::from_secs(args.timeout);
     if !args.skip_baseline {
         let baseline = run_shell(&args.test_command, &root, timeout)?;
-        if baseline.timed_out { return Err(Error::Mutation("baseline test command timed out".into())); }
-        if baseline.exit_code != Some(0) { return Err(Error::Mutation(format!("baseline tests failed with exit code {:?}", baseline.exit_code))); }
+        if baseline.timed_out {
+            return Err(Error::Mutation("baseline test command timed out".into()));
+        }
+        if baseline.exit_code != Some(0) {
+            return Err(Error::Mutation(format!(
+                "baseline tests failed with exit code {:?}",
+                baseline.exit_code
+            )));
+        }
     }
-    let validate = if args.no_validate { None } else { Some(args.validate_command.as_str()) };
-    let results = run_mutations(&root, &mutations, &args.test_command, validate, timeout, args.max_mutants)?;
+    let validate = if args.no_validate {
+        None
+    } else {
+        Some(args.validate_command.as_str())
+    };
+    let results = run_mutations(
+        &root,
+        &mutations,
+        &args.test_command,
+        validate,
+        timeout,
+        args.max_mutants,
+    )?;
     let totals = summary(&results);
-    let report = Report { schema_version: 1, tool: "mutate4rust", version: VERSION, root: root.to_string_lossy().to_string(), summary: totals, mutants: &results };
+    let report = Report {
+        schema_version: 1,
+        tool: "mutate4rust",
+        version: VERSION,
+        root: root.to_string_lossy().to_string(),
+        summary: totals,
+        mutants: &results,
+    };
     let manifest = resolve(&root, &args.manifest);
-    if let Some(parent) = manifest.parent() { fs::create_dir_all(parent)?; }
-    fs::write(&manifest, format!("{}\n", serde_json::to_string_pretty(&report)?))?;
-    if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
-    else {
+    if let Some(parent) = manifest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &manifest,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
         println!("Mutation Report\n===============");
-        println!("Total: {}", report.summary.total); println!("Killed: {}", report.summary.killed); println!("Survived: {}", report.summary.survived); println!("Timeout: {}", report.summary.timeout); println!("Invalid: {}", report.summary.invalid); println!("Compile error: {}", report.summary.compile_error);
-        for result in results.iter().filter(|item| item.status == Status::Survived) { println!("SURVIVED {}:{}:{} {} -> {}", result.mutation.file, result.mutation.line, result.mutation.column, result.mutation.original, result.mutation.replacement); }
+        println!("Total: {}", report.summary.total);
+        println!("Killed: {}", report.summary.killed);
+        println!("Survived: {}", report.summary.survived);
+        println!("Timeout: {}", report.summary.timeout);
+        println!("Invalid: {}", report.summary.invalid);
+        println!("Compile error: {}", report.summary.compile_error);
+        for result in results
+            .iter()
+            .filter(|item| item.status == Status::Survived)
+        {
+            println!(
+                "SURVIVED {}:{}:{} {} -> {}",
+                result.mutation.file,
+                result.mutation.line,
+                result.mutation.column,
+                result.mutation.original,
+                result.mutation.replacement
+            );
+        }
     }
     let infra = report.summary.timeout + report.summary.invalid;
-    if infra > 0 || (report.summary.compile_error > 0 && !args.allow_compile_errors) { return Ok(1); }
-    if report.summary.survived > 0 && !args.allow_survivors { return Ok(2); }
+    if infra > 0 || (report.summary.compile_error > 0 && !args.allow_compile_errors) {
+        return Ok(1);
+    }
+    if report.summary.survived > 0 && !args.allow_survivors {
+        return Ok(2);
+    }
     Ok(0)
 }
 
 fn main() -> ExitCode {
-    match run() { Ok(code) => ExitCode::from(code), Err(error) => { eprintln!("mutate4rust: {error}"); ExitCode::from(1) } }
+    match run() {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("mutate4rust: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
