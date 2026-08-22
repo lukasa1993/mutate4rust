@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -26,7 +26,8 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Build release binary
         run: cargo build --release
-      - name: CLI smoke tests
+      - name: Cargo install smoke test
         run: |
-          ./target/release/mutate4rust --version
-          ./target/release/mutate4rust --help
+          cargo install --path . --root target/native-install --force
+          target/native-install/bin/mutate4rust --version
+          target/native-install/bin/mutate4rust --help
