@@ -112,9 +112,11 @@ impl SingleCfgContext {
     fn meta_attribute_active(&self, meta: &Meta) -> bool {
         match meta {
             Meta::Path(path) if path.is_ident("test") => self.include_tests,
-            Meta::List(list) if list.path.is_ident("cfg") => syn::parse2::<Meta>(list.tokens.clone())
-                .ok()
-                .is_none_or(|predicate| self.eval(&predicate)),
+            Meta::List(list) if list.path.is_ident("cfg") => {
+                syn::parse2::<Meta>(list.tokens.clone())
+                    .ok()
+                    .is_none_or(|predicate| self.eval(&predicate))
+            }
             Meta::List(list) if list.path.is_ident("cfg_attr") => {
                 let Some(items) = parse_meta_list(list.tokens.clone()) else {
                     return true;
