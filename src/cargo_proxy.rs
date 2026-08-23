@@ -155,6 +155,37 @@ fn remove_proxy_directory(directory: &Path) {
     let _ = fs::remove_dir_all(directory);
 }
 
+fn build_proxy(directory: &Path, rustc: &Path, extra: &[String]) -> io::Result<PathBuf> {
+    if let Err(error) = fs::create_dir_all(directory) {
+        remove_proxy_directory(directory);
+        return Err(error);
+    }
+
+    let result = (|| {
+        let source_path = directory.join("cargo_proxy.rs");
+        let executable = directory.join(executable_name("cargo"));
+        fs::write(&source_path, proxy_source(extra))?;
+        let status = Command::new(rustc)
+            .arg("--edition=2021")
+            .arg(&source_path)
+            .arg("-O")
+            .arg("-o")
+            .arg(&executable)
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "rustc failed to build Cargo feature proxy: {status}"
+            )));
+        }
+        Ok(executable)
+    })();
+
+    if result.is_err() {
+        remove_proxy_directory(directory);
+    }
+    result
+}
+
 pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<Guard>> {
     if extra.is_empty() {
         return Ok(None);
@@ -166,23 +197,7 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
         .unwrap_or_else(|| find_on_path("cargo"))?;
     let rustc = find_on_path("rustc")?;
     let directory = proxy_directory(root, tool);
-    fs::create_dir_all(&directory)?;
-    let source_path = directory.join("cargo_proxy.rs");
-    let executable = directory.join(executable_name("cargo"));
-    fs::write(&source_path, proxy_source(extra))?;
-    let status = Command::new(rustc)
-        .arg("--edition=2021")
-        .arg(&source_path)
-        .arg("-O")
-        .arg("-o")
-        .arg(&executable)
-        .status()?;
-    if !status.success() {
-        remove_proxy_directory(&directory);
-        return Err(io::Error::other(format!(
-            "rustc failed to build Cargo feature proxy: {status}"
-        )));
-    }
+    build_proxy(&directory, &rustc, extra)?;
 
     let previous_path = env::var_os("PATH");
     let previous_real_cargo = env::var_os(REAL_CARGO_ENV);
@@ -271,6 +286,20 @@ mod tests {
         fs::create_dir_all(&proxy).unwrap();
         fs::write(proxy.join("cargo_proxy.rs"), "temporary").unwrap();
         remove_proxy_directory(&proxy);
+        assert!(!proxy.exists());
+    }
+
+    #[test]
+    fn failed_proxy_build_removes_the_run_directory() {
+        let dir = tempdir().unwrap();
+        let proxy = proxy_directory(dir.path(), "tool");
+        let missing_rustc = dir.path().join(executable_name("missing-rustc"));
+        let result = build_proxy(
+            &proxy,
+            &missing_rustc,
+            &["--features".into(), "extra".into()],
+        );
+        assert!(result.is_err());
         assert!(!proxy.exists());
     }
 
