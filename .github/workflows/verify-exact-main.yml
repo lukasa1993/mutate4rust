@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  VERIFY_SHA: afc2c92c736d9f496216658261d8a12044ca70d1
+  VERIFY_SHA: 069965788eace9d0b3a7a1f444ad9c04f02143a1
 
 jobs:
   stable:
