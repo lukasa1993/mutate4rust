@@ -4,12 +4,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const REAL_CARGO_ENV: &str = "RUST_QUALITY_REAL_CARGO";
+static NEXT_PROXY_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct Guard {
     previous_path: Option<OsString>,
     previous_real_cargo: Option<OsString>,
+    directory: PathBuf,
 }
 
 impl Drop for Guard {
@@ -22,6 +26,7 @@ impl Drop for Guard {
             Some(value) => env::set_var(REAL_CARGO_ENV, value),
             None => env::remove_var(REAL_CARGO_ENV),
         }
+        remove_proxy_directory(&self.directory);
     }
 }
 
@@ -134,6 +139,22 @@ fn main() {{
     )
 }
 
+fn proxy_directory(root: &Path, tool: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_PROXY_ID.fetch_add(1, Ordering::Relaxed);
+    root.join("target")
+        .join(tool)
+        .join("cargo-proxy")
+        .join(format!("{}-{timestamp}-{sequence}", std::process::id()))
+}
+
+fn remove_proxy_directory(directory: &Path) {
+    let _ = fs::remove_dir_all(directory);
+}
+
 pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<Guard>> {
     if extra.is_empty() {
         return Ok(None);
@@ -144,51 +165,47 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
         .map(Ok)
         .unwrap_or_else(|| find_on_path("cargo"))?;
     let rustc = find_on_path("rustc")?;
-    let directory = root.join("target").join(tool).join("cargo-proxy");
+    let directory = proxy_directory(root, tool);
     fs::create_dir_all(&directory)?;
     let source_path = directory.join("cargo_proxy.rs");
     let executable = directory.join(executable_name("cargo"));
-    let temporary = directory.join(if cfg!(windows) {
-        format!("cargo-{}.exe", std::process::id())
-    } else {
-        format!("cargo-{}", std::process::id())
-    });
     fs::write(&source_path, proxy_source(extra))?;
     let status = Command::new(rustc)
         .arg("--edition=2021")
         .arg(&source_path)
         .arg("-O")
         .arg("-o")
-        .arg(&temporary)
+        .arg(&executable)
         .status()?;
     if !status.success() {
-        let _ = fs::remove_file(&temporary);
+        remove_proxy_directory(&directory);
         return Err(io::Error::other(format!(
             "rustc failed to build Cargo feature proxy: {status}"
         )));
     }
-    if executable.exists() {
-        fs::remove_file(&executable)?;
-    }
-    fs::rename(&temporary, &executable)?;
 
     let previous_path = env::var_os("PATH");
     let previous_real_cargo = env::var_os(REAL_CARGO_ENV);
-    let mut paths = vec![directory];
+    let mut paths = vec![directory.clone()];
     if let Some(value) = &previous_path {
         paths.extend(env::split_paths(value));
     }
-    let joined = env::join_paths(paths).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot construct Cargo proxy PATH: {error}"),
-        )
-    })?;
+    let joined = match env::join_paths(paths) {
+        Ok(value) => value,
+        Err(error) => {
+            remove_proxy_directory(&directory);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot construct Cargo proxy PATH: {error}"),
+            ));
+        }
+    };
     env::set_var(REAL_CARGO_ENV, real_cargo);
     env::set_var("PATH", joined);
     Ok(Some(Guard {
         previous_path,
         previous_real_cargo,
+        directory,
     }))
 }
 
@@ -237,6 +254,24 @@ mod tests {
             vec!["--all-features"]
         );
         assert!(feature_args(&[], false, false).is_empty());
+    }
+
+    #[test]
+    fn proxy_directories_are_unique() {
+        let dir = tempdir().unwrap();
+        let first = proxy_directory(dir.path(), "tool");
+        let second = proxy_directory(dir.path(), "tool");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn proxy_cleanup_removes_the_run_directory() {
+        let dir = tempdir().unwrap();
+        let proxy = proxy_directory(dir.path(), "tool");
+        fs::create_dir_all(&proxy).unwrap();
+        fs::write(proxy.join("cargo_proxy.rs"), "temporary").unwrap();
+        remove_proxy_directory(&proxy);
+        assert!(!proxy.exists());
     }
 
     #[test]
