@@ -76,17 +76,36 @@ fn proxy_source(extra: &[String]) -> String {
         .join(", ");
     format!(
         r#"use std::env;
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::process::{{Command, exit}};
 
 const EXTRA: &[&str] = &[{encoded}];
 
-fn accepts_feature_args(value: &OsStr) -> bool {{
-    value.to_str().is_some_and(|name| matches!(
+fn feature_subcommand(name: &str) -> bool {{
+    matches!(
         name,
         "rustc" | "metadata" | "test" | "check" | "build" | "clippy" |
         "doc" | "run" | "bench" | "fix" | "llvm-cov"
-    ))
+    )
+}}
+
+fn injection_index(args: &[OsString]) -> Option<usize> {{
+    for (index, value) in args.iter().enumerate() {{
+        let Some(name) = value.to_str() else {{
+            continue;
+        }};
+        if feature_subcommand(name) {{
+            return Some(index + 1);
+        }}
+        if name == "nextest" {{
+            for (offset, nested) in args[index + 1..].iter().enumerate() {{
+                if matches!(nested.to_str(), Some("run" | "list")) {{
+                    return Some(index + offset + 2);
+                }}
+            }}
+        }}
+    }}
+    None
 }}
 
 fn main() {{
@@ -94,16 +113,15 @@ fn main() {{
         eprintln!("cargo proxy: {REAL_CARGO_ENV} is not set");
         exit(1);
     }};
-    let mut input = env::args_os().skip(1);
-    let first = input.next();
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
     let mut command = Command::new(real_cargo);
-    if let Some(subcommand) = first {{
-        command.arg(&subcommand);
-        if accepts_feature_args(&subcommand) {{
-            command.args(EXTRA);
-        }}
+    if let Some(index) = injection_index(&args) {{
+        command.args(&args[..index]);
+        command.args(EXTRA);
+        command.args(&args[index..]);
+    }} else {{
+        command.args(&args);
     }}
-    command.args(input);
     match command.status() {{
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(error) => {{
@@ -198,6 +216,16 @@ mod tests {
         fs::remove_file(input).unwrap();
     }
 
+    fn proxy_output(proxy: &Path, fake: &Path, args: &[&str]) -> String {
+        let output = Command::new(proxy)
+            .env(REAL_CARGO_ENV, fake)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     #[test]
     fn feature_arguments_follow_cargo_rules() {
         assert_eq!(
@@ -212,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_proxy_injects_only_supported_cargo_subcommands() {
+    fn compiled_proxy_injects_at_the_cargo_build_scope() {
         let dir = tempdir().unwrap();
         let fake = dir.path().join(executable_name("fake-cargo"));
         compile(
@@ -227,26 +255,18 @@ mod tests {
             &proxy,
         );
 
-        let output = Command::new(&proxy)
-            .env(REAL_CARGO_ENV, &fake)
-            .args(["rustc", "--manifest-path", "Cargo.toml"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
+            proxy_output(&proxy, &fake, &["rustc", "--manifest-path", "Cargo.toml"]),
             "rustc|--features|extra|--manifest-path|Cargo.toml"
         );
-
-        let output = Command::new(&proxy)
-            .env(REAL_CARGO_ENV, &fake)
-            .arg("--version")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            "--version"
+            proxy_output(&proxy, &fake, &["+stable", "test", "--workspace"]),
+            "+stable|test|--features|extra|--workspace"
         );
+        assert_eq!(
+            proxy_output(&proxy, &fake, &["nextest", "run", "--workspace"]),
+            "nextest|run|--features|extra|--workspace"
+        );
+        assert_eq!(proxy_output(&proxy, &fake, &["--version"]), "--version");
     }
 }
