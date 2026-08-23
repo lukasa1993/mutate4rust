@@ -1,1 +1,1 @@
-Trigger the temporary native Rust restoration patcher again.
+Trigger the temporary native Rust restoration patcher after ready-for-review.
