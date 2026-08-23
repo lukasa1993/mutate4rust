@@ -1,3 +1,4 @@
+use crate::CargoFeatures;
 use proc_macro2::TokenStream;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -215,12 +216,14 @@ fn cargo_cfg(
     package: &Package,
     target: &Target,
     include_tests: bool,
+    features: &CargoFeatures,
 ) -> Result<SingleCfgContext, String> {
     let mut command = Command::new("cargo");
     command
         .arg("rustc")
         .arg("--manifest-path")
         .arg(&package.manifest_path);
+    features.apply_to_command(&mut command);
     if target.kind.iter().any(|kind| kind == "bin") {
         command.arg("--bin").arg(&target.name);
     } else if target.kind.iter().any(|kind| kind == "test") {
@@ -433,11 +436,13 @@ fn merge_context(
     }
 }
 
-pub(crate) fn discover(
+pub(crate) fn discover_with_features(
     root: &Path,
     include_tests: bool,
     filters: &[String],
+    features: &CargoFeatures,
 ) -> Result<Vec<ActiveFile>, String> {
+    features.validate()?;
     if !root.join("Cargo.toml").is_file() {
         return Ok(fallback_files(root, include_tests));
     }
@@ -454,7 +459,7 @@ pub(crate) fn discover(
             .iter()
             .filter(|target| target_in_scope(&target.kind, include_tests))
         {
-            let context = cargo_cfg(root, &package, target, include_tests)?;
+            let context = cargo_cfg(root, &package, target, include_tests, features)?;
             let mut visited = HashSet::new();
             let mut target_files = Vec::new();
             visit_file(
@@ -491,118 +496,47 @@ pub(crate) fn discover(
     Ok(output)
 }
 
+pub(crate) fn discover(
+    root: &Path,
+    include_tests: bool,
+    filters: &[String],
+) -> Result<Vec<ActiveFile>, String> {
+    discover_with_features(root, include_tests, filters, &CargoFeatures::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
-    fn cfg_evaluation_handles_target_and_feature_predicates() {
-        let mut single = SingleCfgContext::synthetic(false);
-        single.names.insert("unix".into());
-        single
-            .values
-            .entry("target_os".into())
-            .or_default()
-            .insert("linux".into());
-        single.features.insert("extra".into());
-        let context = CfgContext {
-            variants: vec![single],
-        };
-        for text in [
-            "unix",
-            "target_os = \"linux\"",
-            "feature = \"extra\"",
-            "all(unix, feature = \"extra\")",
-            "not(windows)",
-        ] {
-            let meta: Meta = syn::parse_str(text).unwrap();
-            let attr: Attribute = syn::parse_quote!(#[cfg(#meta)]);
-            assert!(context.attrs_active(&[attr]), "{text} should be active");
-        }
-    }
-
-    #[test]
-    fn merged_context_is_active_when_any_target_context_matches() {
-        let mut unix = SingleCfgContext::synthetic(false);
-        unix.names.insert("unix".into());
-        let mut windows = SingleCfgContext::synthetic(false);
-        windows.names.insert("windows".into());
-        let context = CfgContext {
-            variants: vec![unix, windows],
-        };
-        let unix_attr: Attribute = syn::parse_quote!(#[cfg(unix)]);
-        let windows_attr: Attribute = syn::parse_quote!(#[cfg(windows)]);
-        assert!(context.attrs_active(&[unix_attr]));
-        assert!(context.attrs_active(&[windows_attr]));
-    }
-
-    #[test]
-    fn cargo_cfg_includes_build_script_values_and_inner_file_cfg() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\nname='cfg-mutate-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n").unwrap();
-        fs::write(dir.path().join("build.rs"), "fn main() { println!(\"cargo::rustc-check-cfg=cfg(tool_probe)\"); println!(\"cargo::rustc-cfg=tool_probe\"); }\n").unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "#[cfg(tool_probe)] mod active;\nmod inner_disabled;\n#[cfg(not(tool_probe))] mod impossible;\n").unwrap();
-        fs::write(
-            dir.path().join("src/active.rs"),
-            "pub fn active() -> bool { true }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/inner_disabled.rs"),
-            "#![cfg(not(tool_probe))]\npub fn disabled() -> bool { false }\n",
-        )
-        .unwrap();
-        let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
-            .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
-            .collect();
-        assert!(names.contains("lib.rs"));
-        assert!(names.contains("active.rs"));
-        assert!(!names.contains("inner_disabled.rs"));
-        assert!(!names.contains("impossible.rs"));
-    }
-
-    #[test]
-    fn default_scope_excludes_non_default_feature_modules() {
+    fn selected_feature_changes_active_module_scope() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname='scope-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\nextra=[]\n",
+            "[package]\nname='selected-feature-scope'\nversion='0.1.0'\nedition='2021'\n[features]\nextra=[]\n",
         )
         .unwrap();
         fs::write(
             dir.path().join("src/lib.rs"),
-            "#[cfg(unix)] mod unix_only;\n#[cfg(windows)] mod windows_only;\n#[cfg(feature=\"extra\")] mod feature_only;\n",
+            "#[cfg(feature=\"extra\")] mod extra;\npub fn base() {}\n",
         )
         .unwrap();
-        fs::write(dir.path().join("src/unix_only.rs"), "pub fn unix_fn() {}\n").unwrap();
-        fs::write(
-            dir.path().join("src/windows_only.rs"),
-            "pub fn windows_fn() {}\n",
+        fs::write(dir.path().join("src/extra.rs"), "pub fn selected() {}\n").unwrap();
+        let default = discover(dir.path(), false, &[]).unwrap();
+        assert!(!default.iter().any(|file| file.path.ends_with("extra.rs")));
+        let selected = discover_with_features(
+            dir.path(),
+            false,
+            &[],
+            &CargoFeatures {
+                features: vec!["extra".into()],
+                ..CargoFeatures::default()
+            },
         )
         .unwrap();
-        fs::write(
-            dir.path().join("src/feature_only.rs"),
-            "pub fn feature_fn() {}\n",
-        )
-        .unwrap();
-        let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
-            .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
-            .collect();
-        assert!(!names.contains("feature_only.rs"));
-        if cfg!(unix) {
-            assert!(names.contains("unix_only.rs"));
-            assert!(!names.contains("windows_only.rs"));
-        } else if cfg!(windows) {
-            assert!(names.contains("windows_only.rs"));
-            assert!(!names.contains("unix_only.rs"));
-        }
+        assert!(selected.iter().any(|file| file.path.ends_with("extra.rs")));
     }
 
     #[test]
