@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-const DEFAULT_TEST: &str = "cargo test --workspace --all-features";
-const DEFAULT_VALIDATE: &str = "cargo check --workspace --all-targets --all-features";
+const DEFAULT_TEST: &str = "cargo test --workspace";
+const DEFAULT_VALIDATE: &str = "cargo check --workspace --all-targets";
 
 #[derive(Parser, Debug)]
 #[command(name = "mutate4rust", version = VERSION, about = "Native syntax-aware mutation testing for Rust")]
