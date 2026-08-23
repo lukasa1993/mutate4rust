@@ -1,0 +1,421 @@
+name: Apply restoration repair
+
+on:
+  push:
+    branches: [audit-restoration-20260823]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[restoration-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit-restoration-20260823
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Apply repair with native Rust
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/patch.rs" <<'RS'
+          use std::fs;
+
+          fn one(text: &mut String, from: &str, to: &str) {
+              let count = text.matches(from).count();
+              assert_eq!(count, 1, "expected one match, got {count}: {from}");
+              *text = text.replacen(from, to, 1);
+          }
+
+          fn main() {
+              let path = "src/lib.rs";
+              let mut text = fs::read_to_string(path).unwrap();
+              one(&mut text,
+                  r##"pub fn collect_mutations(
+    root: &Path,
+    include_tests: bool,
+    filters: &[String],
+) -> Result<Vec<Mutation>, Error> {
+    let active = scope::discover(root, include_tests, filters).map_err(Error::Mutation)?;
+"##,
+                  r##"pub fn collect_mutations(
+    root: &Path,
+    include_tests: bool,
+    filters: &[String],
+) -> Result<Vec<Mutation>, Error> {
+    let canonical_root = root.canonicalize()?;
+    let root = canonical_root.as_path();
+    let active = scope::discover(root, include_tests, filters).map_err(Error::Mutation)?;
+"##);
+              one(&mut text,
+                  r##"struct SourceGuard {
+    path: PathBuf,
+    original: Vec<u8>,
+    journal: PathBuf,
+}
+
+impl SourceGuard {
+    fn apply(root: &Path, mutation: &Mutation) -> Result<Self, Error> {
+        let path = resolve_source_path(root, &mutation.file)?;
+        let original = fs::read(&path)?;
+        let journal = root.join(JOURNAL);
+        if let Some(parent) = journal.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let record = JournalRecord {
+            file: mutation.file.clone(),
+            content: BASE64.encode(&original),
+        };
+        fs::write(&journal, serde_json::to_vec_pretty(&record)?)?;
+        let mut changed = original.clone();
+        changed.splice(
+            mutation.start..mutation.end,
+            mutation.replacement.as_bytes().iter().copied(),
+        );
+        fs::write(&path, changed)?;
+        Ok(Self {
+            path,
+            original,
+            journal,
+        })
+    }
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        if fs::write(&self.path, &self.original).is_ok() {
+            let _ = fs::remove_file(&self.journal);
+        }
+    }
+}
+"##,
+                  r##"struct SourceGuard {
+    path: PathBuf,
+    original: Vec<u8>,
+    journal: PathBuf,
+    restored: bool,
+}
+
+impl SourceGuard {
+    fn apply(root: &Path, mutation: &Mutation) -> Result<Self, Error> {
+        let path = resolve_source_path(root, &mutation.file)?;
+        let original = fs::read(&path)?;
+        let journal = root.join(JOURNAL);
+        if let Some(parent) = journal.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let record = JournalRecord {
+            file: mutation.file.clone(),
+            content: BASE64.encode(&original),
+        };
+        fs::write(&journal, serde_json::to_vec_pretty(&record)?)?;
+        let mut changed = original.clone();
+        changed.splice(
+            mutation.start..mutation.end,
+            mutation.replacement.as_bytes().iter().copied(),
+        );
+        fs::write(&path, changed)?;
+        Ok(Self {
+            path,
+            original,
+            journal,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), Error> {
+        fs::write(&self.path, &self.original)?;
+        let observed = fs::read(&self.path)?;
+        if observed != self.original {
+            return Err(Error::Mutation(format!(
+                "source restoration verification failed for {}",
+                self.path.display()
+            )));
+        }
+        fs::remove_file(&self.journal)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        if fs::write(&self.path, &self.original).is_ok()
+            && fs::read(&self.path).is_ok_and(|value| value == self.original)
+        {
+            let _ = fs::remove_file(&self.journal);
+        }
+    }
+}
+"##);
+              one(&mut text,
+                  r##"pub fn run_mutations(
+    root: &Path,
+    mutations: &[Mutation],
+    test_command: &str,
+    validate_command: Option<&str>,
+    timeout: Duration,
+    max_mutants: Option<usize>,
+) -> Result<Vec<MutationResult>, Error> {
+    recover_active(root)?;
+    let limit = max_mutants.unwrap_or(mutations.len()).min(mutations.len());
+    let mut results = Vec::with_capacity(limit);
+    for mutation in mutations.iter().take(limit) {
+        let guard = SourceGuard::apply(root, mutation)?;
+        if !source_parses(&guard.path) {
+            results.push(MutationResult {
+                mutation: mutation.clone(),
+                status: Status::Invalid,
+                exit_code: None,
+                duration_seconds: 0.0,
+                detail: Some("mutated source does not parse".into()),
+            });
+            drop(guard);
+            continue;
+        }
+        if let Some(command) = validate_command {
+            let validation = run_shell(command, root, timeout)?;
+            if validation.timed_out {
+                results.push(MutationResult {
+                    mutation: mutation.clone(),
+                    status: Status::Timeout,
+                    exit_code: None,
+                    duration_seconds: validation.duration.as_secs_f64(),
+                    detail: Some("validation timed out".into()),
+                });
+                drop(guard);
+                continue;
+            }
+            if validation.exit_code != Some(0) {
+                let detail: String = validation
+                    .output
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                results.push(MutationResult {
+                    mutation: mutation.clone(),
+                    status: Status::CompileError,
+                    exit_code: validation.exit_code,
+                    duration_seconds: validation.duration.as_secs_f64(),
+                    detail: Some(detail),
+                });
+                drop(guard);
+                continue;
+            }
+        }
+        let execution = run_shell(test_command, root, timeout)?;
+        let (status, detail) = if execution.timed_out {
+            (Status::Timeout, Some("test command timed out".into()))
+        } else if execution.exit_code == Some(0) {
+            (Status::Survived, None)
+        } else {
+            (Status::Killed, None)
+        };
+        results.push(MutationResult {
+            mutation: mutation.clone(),
+            status,
+            exit_code: execution.exit_code,
+            duration_seconds: execution.duration.as_secs_f64(),
+            detail,
+        });
+        drop(guard);
+    }
+    Ok(results)
+}
+"##,
+                  r##"pub fn run_mutations(
+    root: &Path,
+    mutations: &[Mutation],
+    test_command: &str,
+    validate_command: Option<&str>,
+    timeout: Duration,
+    max_mutants: Option<usize>,
+) -> Result<Vec<MutationResult>, Error> {
+    recover_active(root)?;
+    let limit = max_mutants.unwrap_or(mutations.len()).min(mutations.len());
+    let mut results = Vec::with_capacity(limit);
+    for mutation in mutations.iter().take(limit) {
+        let mut guard = SourceGuard::apply(root, mutation)?;
+        if !source_parses(&guard.path) {
+            let result = MutationResult {
+                mutation: mutation.clone(),
+                status: Status::Invalid,
+                exit_code: None,
+                duration_seconds: 0.0,
+                detail: Some("mutated source does not parse".into()),
+            };
+            guard.restore()?;
+            results.push(result);
+            continue;
+        }
+        if let Some(command) = validate_command {
+            let validation = match run_shell(command, root, timeout) {
+                Ok(result) => result,
+                Err(error) => {
+                    guard.restore()?;
+                    return Err(error);
+                }
+            };
+            if validation.timed_out {
+                let result = MutationResult {
+                    mutation: mutation.clone(),
+                    status: Status::Timeout,
+                    exit_code: None,
+                    duration_seconds: validation.duration.as_secs_f64(),
+                    detail: Some("validation timed out".into()),
+                };
+                guard.restore()?;
+                results.push(result);
+                continue;
+            }
+            if validation.exit_code != Some(0) {
+                let detail: String = validation
+                    .output
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let result = MutationResult {
+                    mutation: mutation.clone(),
+                    status: Status::CompileError,
+                    exit_code: validation.exit_code,
+                    duration_seconds: validation.duration.as_secs_f64(),
+                    detail: Some(detail),
+                };
+                guard.restore()?;
+                results.push(result);
+                continue;
+            }
+        }
+        let execution = match run_shell(test_command, root, timeout) {
+            Ok(result) => result,
+            Err(error) => {
+                guard.restore()?;
+                return Err(error);
+            }
+        };
+        let (status, detail) = if execution.timed_out {
+            (Status::Timeout, Some("test command timed out".into()))
+        } else if execution.exit_code == Some(0) {
+            (Status::Survived, None)
+        } else {
+            (Status::Killed, None)
+        };
+        let result = MutationResult {
+            mutation: mutation.clone(),
+            status,
+            exit_code: execution.exit_code,
+            duration_seconds: execution.duration.as_secs_f64(),
+            detail,
+        };
+        guard.restore()?;
+        results.push(result);
+    }
+    Ok(results)
+}
+"##);
+              one(&mut text,
+                  r##"    #[test]
+    fn recovery_rejects_parent_path_escape() {
+"##,
+                  r##"    #[test]
+    fn run_mutations_restores_source_byte_for_byte() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        let original = b"// byte sentinel\r\npub fn yes() -> bool { true }\r\n";
+        fs::write(&path, original).unwrap();
+        let mutation = enumerate_mutations(&path, dir.path(), 1)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.original == "true")
+            .unwrap();
+        let results = run_mutations(
+            dir.path(),
+            &[mutation],
+            "exit 1",
+            None,
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Killed);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!dir.path().join(JOURNAL).exists());
+    }
+
+    #[test]
+    fn collection_with_relative_cargo_root_returns_relative_paths() {
+        let dir = tempfile::Builder::new()
+            .prefix("mutate-relative-root-")
+            .tempdir_in(".")
+            .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='mutation-relative-root-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn value() -> bool { true }\n",
+        )
+        .unwrap();
+        let mutations = collect_mutations(dir.path(), false, &[]).unwrap();
+        assert!(!mutations.is_empty());
+        assert!(mutations
+            .iter()
+            .all(|mutation| !Path::new(&mutation.file).is_absolute()));
+        assert!(mutations.iter().all(|mutation| mutation.file == "src/lib.rs"));
+    }
+
+    #[test]
+    fn recovery_rejects_parent_path_escape() {
+"##);
+              one(&mut text,
+                  r##"        let guard = SourceGuard::apply(dir.path(), &mutation).unwrap();
+        let journal = dir.path().join(JOURNAL);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&src).unwrap();
+        fs::write(&src, "not a directory").unwrap();
+
+        drop(guard);
+
+        assert!(journal.exists());
+"##,
+                  r##"        let mut guard = SourceGuard::apply(dir.path(), &mutation).unwrap();
+        let journal = dir.path().join(JOURNAL);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&src).unwrap();
+        fs::write(&src, "not a directory").unwrap();
+
+        assert!(guard.restore().is_err());
+        assert!(journal.exists());
+"##);
+              fs::write(path, text).unwrap();
+          }
+          RS
+          rustc --edition=2021 "$RUNNER_TEMP/patch.rs" -o "$RUNNER_TEMP/patch"
+          "$RUNNER_TEMP/patch"
+          cargo fmt --all
+      - name: Commit repair and remove patcher
+        shell: bash
+        run: |
+          git rm .github/workflows/audit-apply-restoration.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lib.rs
+          git commit -m 'Verify byte-for-byte source restoration [restoration-applied]'
+          git push origin HEAD:audit-restoration-20260823
