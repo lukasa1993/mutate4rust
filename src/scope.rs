@@ -14,10 +14,9 @@ struct SingleCfgContext {
     names: HashSet<String>,
     values: HashMap<String, HashSet<String>>,
     features: HashSet<String>,
-    include_tests: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CfgContext {
     variants: Vec<SingleCfgContext>,
 }
@@ -71,24 +70,19 @@ fn literal_string(expr: &Expr) -> Option<String> {
 }
 
 impl SingleCfgContext {
-    fn synthetic(include_tests: bool) -> Self {
+    fn empty() -> Self {
         Self {
             names: HashSet::new(),
             values: HashMap::new(),
             features: HashSet::new(),
-            include_tests,
         }
     }
 
     fn eval(&self, meta: &Meta) -> bool {
         match meta {
-            Meta::Path(path) => {
-                if path.is_ident("test") {
-                    return self.include_tests;
-                }
-                path.get_ident()
-                    .is_some_and(|name| self.names.contains(&name.to_string()))
-            }
+            Meta::Path(path) => path
+                .get_ident()
+                .is_some_and(|name| self.names.contains(&name.to_string())),
             Meta::NameValue(value) => {
                 let Some(key) = value.path.get_ident().map(ToString::to_string) else {
                     return false;
@@ -116,7 +110,7 @@ impl SingleCfgContext {
 
     fn meta_attribute_active(&self, meta: &Meta) -> bool {
         match meta {
-            Meta::Path(path) if path.is_ident("test") => self.include_tests,
+            Meta::Path(path) if path.is_ident("test") => self.names.contains("test"),
             Meta::List(list) if list.path.is_ident("cfg") => {
                 syn::parse2::<Meta>(list.tokens.clone())
                     .ok()
@@ -169,9 +163,9 @@ impl SingleCfgContext {
 }
 
 impl CfgContext {
-    fn synthetic(include_tests: bool) -> Self {
+    fn from_single(context: SingleCfgContext, include_tests: bool) -> Self {
         Self {
-            variants: vec![SingleCfgContext::synthetic(include_tests)],
+            variants: contexts_for_tests(context, include_tests),
         }
     }
 
@@ -180,10 +174,33 @@ impl CfgContext {
             .iter()
             .any(|context| context.attrs_active(attrs))
     }
+
+    pub(crate) fn single_variants(&self) -> Vec<Self> {
+        self.variants
+            .iter()
+            .cloned()
+            .map(|context| Self {
+                variants: vec![context],
+            })
+            .collect()
+    }
 }
 
-fn parse_cfg_output(text: &str, include_tests: bool) -> SingleCfgContext {
-    let mut context = SingleCfgContext::synthetic(include_tests);
+fn contexts_for_tests(
+    context: SingleCfgContext,
+    include_tests: bool,
+) -> Vec<SingleCfgContext> {
+    let mut variants = vec![context.clone()];
+    if include_tests && !context.names.contains("test") {
+        let mut test_context = context;
+        test_context.names.insert("test".into());
+        variants.push(test_context);
+    }
+    variants
+}
+
+fn parse_cfg_output(text: &str) -> SingleCfgContext {
+    let mut context = SingleCfgContext::empty();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Some((key, value)) = line.split_once('=') {
             let value = value.trim_matches('"').to_string();
@@ -202,12 +219,7 @@ fn parse_cfg_output(text: &str, include_tests: bool) -> SingleCfgContext {
     context
 }
 
-fn cargo_cfg(
-    root: &Path,
-    package: &Package,
-    target: &Target,
-    include_tests: bool,
-) -> Result<SingleCfgContext, String> {
+fn cargo_cfg(root: &Path, package: &Package, target: &Target) -> Result<SingleCfgContext, String> {
     let mut command = Command::new("cargo");
     command
         .arg("rustc")
@@ -236,7 +248,25 @@ fn cargo_cfg(
     }
     let text = String::from_utf8(output.stdout)
         .map_err(|error| format!("cargo rustc cfg output is invalid UTF-8: {error}"))?;
-    Ok(parse_cfg_output(&text, include_tests))
+    Ok(parse_cfg_output(&text))
+}
+
+fn host_cfg(root: &Path) -> Result<SingleCfgContext, String> {
+    let output = Command::new("rustc")
+        .args(["--print", "cfg"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run rustc --print cfg: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc cfg discovery failed with exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("rustc cfg output is invalid UTF-8: {error}"))?;
+    Ok(parse_cfg_output(&text))
 }
 
 fn cargo_metadata(root: &Path) -> Result<Metadata, String> {
@@ -449,8 +479,8 @@ fn ignored(entry: &DirEntry) -> bool {
     )
 }
 
-fn fallback_files(root: &Path, include_tests: bool) -> Vec<ActiveFile> {
-    let context = CfgContext::synthetic(include_tests);
+fn fallback_files(root: &Path, include_tests: bool) -> Result<Vec<ActiveFile>, String> {
+    let context = CfgContext::from_single(host_cfg(root)?, include_tests);
     let mut files: Vec<_> = WalkDir::new(root)
         .into_iter()
         .filter_entry(|entry| !ignored(entry))
@@ -489,7 +519,7 @@ fn fallback_files(root: &Path, include_tests: bool) -> Vec<ActiveFile> {
         })
         .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    files
+    Ok(files)
 }
 
 fn merge_context(
@@ -509,7 +539,7 @@ pub(crate) fn discover(
     filters: &[String],
 ) -> Result<Vec<ActiveFile>, String> {
     if !root.join("Cargo.toml").is_file() {
-        return Ok(fallback_files(root, include_tests));
+        return fallback_files(root, include_tests);
     }
     let metadata = cargo_metadata(root)?;
     let workspace: HashSet<_> = metadata.workspace_members.into_iter().collect();
@@ -524,19 +554,21 @@ pub(crate) fn discover(
             .iter()
             .filter(|target| target_in_scope(&target.kind, include_tests))
         {
-            let context = cargo_cfg(root, &package, target, include_tests)?;
-            let mut visited = HashSet::new();
-            let mut target_files = Vec::new();
-            let module_dir = root_module_dir(&target.src_path);
-            visit_file(
-                &target.src_path,
-                &module_dir,
-                &context,
-                &mut visited,
-                &mut target_files,
-            )?;
-            for (path, context) in target_files {
-                merge_context(&mut merged, path, context);
+            let base_context = cargo_cfg(root, &package, target)?;
+            for context in contexts_for_tests(base_context, include_tests) {
+                let mut visited = HashSet::new();
+                let mut target_files = Vec::new();
+                let module_dir = root_module_dir(&target.src_path);
+                visit_file(
+                    &target.src_path,
+                    &module_dir,
+                    &context,
+                    &mut visited,
+                    &mut target_files,
+                )?;
+                for (path, context) in target_files {
+                    merge_context(&mut merged, path, context);
+                }
             }
         }
     }
@@ -569,9 +601,9 @@ mod tests {
 
     #[test]
     fn merged_context_accepts_either_target_cfg() {
-        let mut unix = SingleCfgContext::synthetic(false);
+        let mut unix = SingleCfgContext::empty();
         unix.names.insert("unix".into());
-        let mut windows = SingleCfgContext::synthetic(false);
+        let mut windows = SingleCfgContext::empty();
         windows.names.insert("windows".into());
         let context = CfgContext {
             variants: vec![unix, windows],
@@ -580,6 +612,32 @@ mod tests {
         let windows_attr: Attribute = syn::parse_quote!(#[cfg(windows)]);
         assert!(context.attrs_active(&[unix_attr]));
         assert!(context.attrs_active(&[windows_attr]));
+    }
+
+    #[test]
+    fn include_tests_keeps_production_cfg_and_adds_test_cfg() {
+        let mut base = SingleCfgContext::empty();
+        base.names.insert("unix".into());
+        let context = CfgContext::from_single(base, true);
+        let production: Attribute = syn::parse_quote!(#[cfg(not(test))]);
+        let test: Attribute = syn::parse_quote!(#[cfg(test)]);
+        assert!(context.attrs_active(&[production]));
+        assert!(context.attrs_active(&[test]));
+        assert_eq!(context.single_variants().len(), 2);
+    }
+
+    #[test]
+    fn standalone_scope_uses_host_cfg() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("standalone.rs"), "fn standalone() {}\n").unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        let host_attr: Attribute = if cfg!(windows) {
+            syn::parse_quote!(#[cfg(windows)])
+        } else {
+            syn::parse_quote!(#[cfg(unix)])
+        };
+        assert!(files[0].cfg.attrs_active(&[host_attr]));
     }
 
     #[test]
