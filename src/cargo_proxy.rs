@@ -4,8 +4,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const REAL_CARGO_ENV: &str = "RUST_QUALITY_REAL_CARGO";
+static NEXT_PROXY_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct Guard {
     previous_path: Option<OsString>,
@@ -134,6 +137,18 @@ fn main() {{
     )
 }
 
+fn proxy_directory(root: &Path, tool: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_PROXY_ID.fetch_add(1, Ordering::Relaxed);
+    root.join("target")
+        .join(tool)
+        .join("cargo-proxy")
+        .join(format!("{}-{timestamp}-{sequence}", std::process::id()))
+}
+
 pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<Guard>> {
     if extra.is_empty() {
         return Ok(None);
@@ -144,33 +159,24 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
         .map(Ok)
         .unwrap_or_else(|| find_on_path("cargo"))?;
     let rustc = find_on_path("rustc")?;
-    let directory = root.join("target").join(tool).join("cargo-proxy");
+    let directory = proxy_directory(root, tool);
     fs::create_dir_all(&directory)?;
     let source_path = directory.join("cargo_proxy.rs");
     let executable = directory.join(executable_name("cargo"));
-    let temporary = directory.join(if cfg!(windows) {
-        format!("cargo-{}.exe", std::process::id())
-    } else {
-        format!("cargo-{}", std::process::id())
-    });
     fs::write(&source_path, proxy_source(extra))?;
     let status = Command::new(rustc)
         .arg("--edition=2021")
         .arg(&source_path)
         .arg("-O")
         .arg("-o")
-        .arg(&temporary)
+        .arg(&executable)
         .status()?;
     if !status.success() {
-        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_dir_all(&directory);
         return Err(io::Error::other(format!(
             "rustc failed to build Cargo feature proxy: {status}"
         )));
     }
-    if executable.exists() {
-        fs::remove_file(&executable)?;
-    }
-    fs::rename(&temporary, &executable)?;
 
     let previous_path = env::var_os("PATH");
     let previous_real_cargo = env::var_os(REAL_CARGO_ENV);
@@ -237,6 +243,14 @@ mod tests {
             vec!["--all-features"]
         );
         assert!(feature_args(&[], false, false).is_empty());
+    }
+
+    #[test]
+    fn proxy_directories_are_unique() {
+        let dir = tempdir().unwrap();
+        let first = proxy_directory(dir.path(), "tool");
+        let second = proxy_directory(dir.path(), "tool");
+        assert_ne!(first, second);
     }
 
     #[test]
