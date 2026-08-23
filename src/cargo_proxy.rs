@@ -5,9 +5,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const REAL_CARGO_ENV: &str = "RUST_QUALITY_REAL_CARGO";
+const CLEANUP_ATTEMPTS: usize = 8;
 static NEXT_PROXY_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct Guard {
@@ -151,8 +153,32 @@ fn proxy_directory(root: &Path, tool: &str) -> PathBuf {
         .join(format!("{}-{timestamp}-{sequence}", std::process::id()))
 }
 
+fn remove_proxy_directory_with<F>(directory: &Path, mut remove: F)
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    for attempt in 0..CLEANUP_ATTEMPTS {
+        match remove(directory) {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) if attempt + 1 == CLEANUP_ATTEMPTS => {
+                eprintln!(
+                    "warning: cannot remove Cargo proxy directory {} after {} attempts: {error}",
+                    directory.display(),
+                    CLEANUP_ATTEMPTS
+                );
+                return;
+            }
+            Err(_) => {
+                let delay_ms = 10_u64 << attempt.min(6);
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+        }
+    }
+}
+
 fn remove_proxy_directory(directory: &Path) {
-    let _ = fs::remove_dir_all(directory);
+    remove_proxy_directory_with(directory, |path| fs::remove_dir_all(path));
 }
 
 fn build_proxy(directory: &Path, rustc: &Path, extra: &[String]) -> io::Result<PathBuf> {
@@ -287,6 +313,20 @@ mod tests {
         fs::write(proxy.join("cargo_proxy.rs"), "temporary").unwrap();
         remove_proxy_directory(&proxy);
         assert!(!proxy.exists());
+    }
+
+    #[test]
+    fn proxy_cleanup_retries_transient_failures() {
+        let mut attempts = 0;
+        remove_proxy_directory_with(Path::new("unused"), |_| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempts, 3);
     }
 
     #[test]
