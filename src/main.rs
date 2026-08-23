@@ -125,11 +125,8 @@ fn require_successful_baseline(
 fn run() -> Result<u8, Error> {
     let args = Args::parse();
     let root = args.root.canonicalize()?;
-    let cargo_args = cargo_proxy::feature_args(
-        &args.features,
-        args.all_features,
-        args.no_default_features,
-    );
+    let cargo_args =
+        cargo_proxy::feature_args(&args.features, args.all_features, args.no_default_features);
     let _cargo_proxy = cargo_proxy::install(&root, "mutate4rust", &cargo_args)?;
     recover_active(&root)?;
     let mutations = collect_mutations(&root, args.include_tests, &args.filters)?;
