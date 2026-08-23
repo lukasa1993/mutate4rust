@@ -42,6 +42,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock src/lib.rs
           git commit -m "Harden mutation recovery and command I/O"
+          git fetch origin mutation-safety-v202
+          git rebase origin/mutation-safety-v202
           git push origin HEAD:mutation-safety-v202
 
   stable:
