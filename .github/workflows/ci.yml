@@ -9,44 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  apply-cargo-cfg:
-    if: github.ref == 'refs/heads/cargo-cfg-v204' || github.event.pull_request.head.ref == 'cargo-cfg-v204'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: cargo-cfg-v204
-          fetch-depth: 0
-      - name: Install stable Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-      - name: Integrate and verify exact Cargo cfg discovery
-        shell: bash
-        run: |
-          if grep -q 'fn cargo_cfg(' src/scope.rs; then
-            echo 'Cargo cfg fidelity patch is already integrated.'
-            exit 0
-          fi
-          mkdir -p target
-          rustc tools/patch_cargo_cfg.rs -o target/patch-cargo-cfg
-          target/patch-cargo-cfg
-          cargo fmt --all
-          cargo check --all-targets --all-features
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets --all-features
-          cargo check --locked --all-targets --all-features
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock src/scope.rs
-          git commit -m "Use Cargo compiler cfg for mutation scope"
-          git fetch origin cargo-cfg-v204
-          git rebase origin/cargo-cfg-v204
-          git push origin HEAD:cargo-cfg-v204
-
   stable:
     strategy:
       fail-fast: false
