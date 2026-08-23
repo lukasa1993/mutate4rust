@@ -13,6 +13,7 @@ static NEXT_PROXY_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Guard {
     previous_path: Option<OsString>,
     previous_real_cargo: Option<OsString>,
+    directory: PathBuf,
 }
 
 impl Drop for Guard {
@@ -25,6 +26,7 @@ impl Drop for Guard {
             Some(value) => env::set_var(REAL_CARGO_ENV, value),
             None => env::remove_var(REAL_CARGO_ENV),
         }
+        remove_proxy_directory(&self.directory);
     }
 }
 
@@ -149,6 +151,10 @@ fn proxy_directory(root: &Path, tool: &str) -> PathBuf {
         .join(format!("{}-{timestamp}-{sequence}", std::process::id()))
 }
 
+fn remove_proxy_directory(directory: &Path) {
+    let _ = fs::remove_dir_all(directory);
+}
+
 pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<Guard>> {
     if extra.is_empty() {
         return Ok(None);
@@ -172,7 +178,7 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
         .arg(&executable)
         .status()?;
     if !status.success() {
-        let _ = fs::remove_dir_all(&directory);
+        remove_proxy_directory(&directory);
         return Err(io::Error::other(format!(
             "rustc failed to build Cargo feature proxy: {status}"
         )));
@@ -180,21 +186,26 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
 
     let previous_path = env::var_os("PATH");
     let previous_real_cargo = env::var_os(REAL_CARGO_ENV);
-    let mut paths = vec![directory];
+    let mut paths = vec![directory.clone()];
     if let Some(value) = &previous_path {
         paths.extend(env::split_paths(value));
     }
-    let joined = env::join_paths(paths).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot construct Cargo proxy PATH: {error}"),
-        )
-    })?;
+    let joined = match env::join_paths(paths) {
+        Ok(value) => value,
+        Err(error) => {
+            remove_proxy_directory(&directory);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot construct Cargo proxy PATH: {error}"),
+            ));
+        }
+    };
     env::set_var(REAL_CARGO_ENV, real_cargo);
     env::set_var("PATH", joined);
     Ok(Some(Guard {
         previous_path,
         previous_real_cargo,
+        directory,
     }))
 }
 
@@ -251,6 +262,16 @@ mod tests {
         let first = proxy_directory(dir.path(), "tool");
         let second = proxy_directory(dir.path(), "tool");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn proxy_cleanup_removes_the_run_directory() {
+        let dir = tempdir().unwrap();
+        let proxy = proxy_directory(dir.path(), "tool");
+        fs::create_dir_all(&proxy).unwrap();
+        fs::write(proxy.join("cargo_proxy.rs"), "temporary").unwrap();
+        remove_proxy_directory(&proxy);
+        assert!(!proxy.exists());
     }
 
     #[test]
