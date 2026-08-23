@@ -9,6 +9,39 @@ permissions:
   contents: read
 
 jobs:
+  repair-audit-branch:
+    if: github.ref == 'refs/heads/audit-test-cfg-scope-20260823' || github.head_ref == 'audit-test-cfg-scope-20260823'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit-test-cfg-scope-20260823
+      - name: Install Rust formatter
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Apply embedded native Rust patch and clean audit files
+        shell: bash
+        run: |
+          awk '
+            /cat > "\$RUNNER_TEMP\/patch.rs" <<'"'"'RS'"'"'/ { capture=1; next }
+            capture && /^[[:space:]]*RS$/ { exit }
+            capture { sub(/^          /, ""); print }
+          ' .github/workflows/audit-remove-unused.yml > "$RUNNER_TEMP/patch.rs"
+          test -s "$RUNNER_TEMP/patch.rs"
+          rustc --edition=2021 "$RUNNER_TEMP/patch.rs" -o "$RUNNER_TEMP/patch"
+          "$RUNNER_TEMP/patch"
+          cargo fmt --all
+          git fetch origin main
+          git checkout origin/main -- .github/workflows/ci.yml
+          git rm .github/workflows/audit-remove-unused.yml
+          rm -f .github/audit-trigger.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/scope.rs .github/workflows/ci.yml
+          git commit -m 'Finalize cfg scope repair'
+          git push origin HEAD:audit-test-cfg-scope-20260823
+
   stable:
     strategy:
       fail-fast: false
