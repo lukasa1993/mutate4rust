@@ -463,7 +463,11 @@ mod tests {
             "#[cfg(unix)] mod unix_only;\n#[cfg(windows)] mod windows_only;\n#[cfg(feature=\"extra\")] mod feature_only;\n",
         )
         .unwrap();
-        fs::write(dir.path().join("src/unix_only.rs"), "pub fn unix_fn() { let _ = true; }\n").unwrap();
+        fs::write(
+            dir.path().join("src/unix_only.rs"),
+            "pub fn unix_fn() { let _ = true; }\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("src/windows_only.rs"),
             "pub fn windows_fn() { let _ = false; }\n",
