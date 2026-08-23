@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -145,10 +145,9 @@ pub fn install(root: &Path, tool: &str, extra: &[String]) -> io::Result<Option<G
         .status()?;
     if !status.success() {
         let _ = fs::remove_file(&temporary);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("rustc failed to build Cargo feature proxy: {status}"),
-        ));
+        return Err(io::Error::other(format!(
+            "rustc failed to build Cargo feature proxy: {status}"
+        )));
     }
     if executable.exists() {
         fs::remove_file(&executable)?;
