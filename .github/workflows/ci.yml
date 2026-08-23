@@ -31,6 +31,7 @@ jobs:
             echo 'Mutation safety patch is already applied.'
             exit 0
           fi
+          mkdir -p target
           rustc tools/patch_mutation_safety.rs -o target/patch-mutation-safety
           target/patch-mutation-safety
           cargo fmt --all
