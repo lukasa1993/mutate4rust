@@ -92,6 +92,7 @@ impl RunLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         if !try_lock_file(&file)? {
             return Err(Error::Mutation(format!(
