@@ -9,44 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  apply-cargo-scope:
-    if: github.ref == 'refs/heads/cargo-scope-v203' || github.event.pull_request.head.ref == 'cargo-scope-v203'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: cargo-scope-v203
-          fetch-depth: 0
-      - name: Install stable Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-      - name: Integrate and verify Cargo-aware mutation scope
-        shell: bash
-        run: |
-          if grep -q '^mod scope;' src/lib.rs; then
-            echo 'Cargo-aware mutation scope is already integrated.'
-            exit 0
-          fi
-          mkdir -p target
-          rustc tools/patch_cargo_scope.rs -o target/patch-cargo-scope
-          target/patch-cargo-scope
-          cargo fmt --all
-          cargo check --all-targets --all-features
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets --all-features
-          cargo check --locked --all-targets --all-features
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock src/lib.rs src/scope.rs
-          git commit -m "Use Cargo-aware active mutation scope"
-          git fetch origin cargo-scope-v203
-          git rebase origin/cargo-scope-v203
-          git push origin HEAD:cargo-scope-v203
-
   stable:
     strategy:
       fail-fast: false
