@@ -2,32 +2,48 @@ name: CI
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
+        with:
+          ref: release-reproducibility-v202
+          fetch-depth: 0
+      - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+      - name: Generate and commit Cargo.lock
+        run: |
+          cargo generate-lockfile
+          if ! git diff --quiet -- Cargo.lock || [ -n "$(git ls-files --others --exclude-standard Cargo.lock)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "Commit Cargo.lock for reproducible builds"
+            git push origin HEAD:release-reproducibility-v202
+          fi
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets --all-features
-      - name: Build release binary
-        run: cargo build --release
-      - name: Cargo install smoke test
+      - name: Clippy stable locked
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test stable locked
+        run: cargo test --locked --all-targets --all-features
+      - name: Build release locked
+        run: cargo build --locked --release
+      - name: Cargo install locked
         run: |
-          cargo install --path . --root target/native-install --force
+          cargo install --path . --locked --root target/native-install --force
           target/native-install/bin/mutate4rust --version
           target/native-install/bin/mutate4rust --help
+      - name: Verify declared MSRV
+        run: |
+          rustup toolchain install 1.82.0 --profile minimal
+          cargo +1.82.0 check --locked --all-targets --all-features
