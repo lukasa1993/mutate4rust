@@ -9,65 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  maintenance:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/default-cargo-features-v205'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: default-cargo-features-v205
-          fetch-depth: 0
-      - name: Apply Rust source changes and verify
-        shell: bash
-        run: |
-          set -euo pipefail
-          perl -0pi -e 's/\n        \.arg\("--all-features"\);/;/g' src/scope.rs
-          sed -i 's/ --all-features//g' src/main.rs
-          sed -i 's/assert!(names.contains("feature_only.rs"));/assert!(!names.contains("feature_only.rs"));/' src/scope.rs
-          if ! grep -q 'default_scope_supports_mutually_exclusive_features' src/scope.rs; then
-            cat >> src/scope.rs <<'RS'
-
-#[cfg(test)]
-mod default_feature_contract_tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn default_scope_supports_mutually_exclusive_features() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname='mutually-exclusive-mutation-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\na=[]\nb=[]\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/lib.rs"),
-            "#[cfg(all(feature=\"a\", feature=\"b\"))] compile_error!(\"features a and b are mutually exclusive\");\npub fn active() -> bool { true }\n",
-        )
-        .unwrap();
-        let files = discover(dir.path(), false, &[]).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path.file_name().and_then(|name| name.to_str()), Some("lib.rs"));
-    }
-}
-RS
-          fi
-          cargo fmt --all
-          cargo check --locked --all-targets --all-features
-          cargo test --locked --all-targets --all-features
-          git fetch origin main --depth=1
-          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/scope.rs src/main.rs .github/workflows/ci.yml
-          if ! git diff --cached --quiet; then
-            git commit -m "Use Cargo default features by default"
-            git push origin HEAD:default-cargo-features-v205
-          fi
-
   stable:
     strategy:
       fail-fast: false
