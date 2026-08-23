@@ -186,10 +186,7 @@ impl CfgContext {
     }
 }
 
-fn contexts_for_tests(
-    context: SingleCfgContext,
-    include_tests: bool,
-) -> Vec<SingleCfgContext> {
+fn contexts_for_tests(context: SingleCfgContext, include_tests: bool) -> Vec<SingleCfgContext> {
     let mut variants = vec![context.clone()];
     if include_tests && !context.names.contains("test") {
         let mut test_context = context;
