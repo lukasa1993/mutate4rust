@@ -1,6 +1,6 @@
 [package]
 name = "mutate4rust"
-version = "2.0.4"
+version = "2.0.3"
 edition = "2021"
 rust-version = "1.82"
 description = "Native syntax-aware mutation testing for Rust"
@@ -25,4 +25,4 @@ walkdir = "2"
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "=3.20.0"
+tempfile = "=3.26.0"
