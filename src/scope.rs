@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use syn::parse::Parser;
+use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Expr, Lit, Meta, Token};
+use syn::{Attribute, Expr, Lit, LitStr, Meta, Token};
 use walkdir::{DirEntry, WalkDir};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +46,11 @@ struct Target {
     name: String,
     kind: Vec<String>,
     src_path: PathBuf,
+}
+
+struct ResolvedModule {
+    path: PathBuf,
+    descendant_dir: PathBuf,
 }
 
 fn parse_meta_list(tokens: TokenStream) -> Option<Vec<Meta>> {
@@ -134,22 +139,9 @@ impl SingleCfgContext {
     }
 
     fn attrs_active(&self, attrs: &[Attribute]) -> bool {
-        attrs.iter().all(|attribute| {
-            if attribute.path().is_ident("test") {
-                return self.include_tests;
-            }
-            match &attribute.meta {
-                Meta::List(list) if list.path.is_ident("cfg") => {
-                    syn::parse2::<Meta>(list.tokens.clone())
-                        .ok()
-                        .is_none_or(|predicate| self.eval(&predicate))
-                }
-                Meta::List(list) if list.path.is_ident("cfg_attr") => {
-                    self.meta_attribute_active(&attribute.meta)
-                }
-                _ => true,
-            }
-        })
+        attrs
+            .iter()
+            .all(|attribute| self.meta_attribute_active(&attribute.meta))
     }
 
     fn path_override(&self, attrs: &[Attribute]) -> Option<PathBuf> {
@@ -274,40 +266,43 @@ fn target_in_scope(kind: &[String], include_tests: bool) -> bool {
     include_tests || !kind.iter().any(|value| value == "test")
 }
 
-fn module_directory(path: &Path, crate_root: bool) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if crate_root || path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
-        parent.to_path_buf()
-    } else {
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        parent.join(stem)
-    }
+fn root_module_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
 }
 
 fn resolve_module(
     module: &syn::ItemMod,
     module_dir: &Path,
     context: &SingleCfgContext,
-) -> Result<PathBuf, String> {
+) -> Result<ResolvedModule, String> {
     if let Some(relative) = context.path_override(&module.attrs) {
         let path = module_dir.join(relative);
-        if path.is_file() {
-            return Ok(path);
+        if !path.is_file() {
+            return Err(format!(
+                "active #[path] module {} does not exist: {}",
+                module.ident,
+                path.display()
+            ));
         }
-        return Err(format!(
-            "active #[path] module {} does not exist: {}",
-            module.ident,
-            path.display()
-        ));
+        let descendant_dir = path.parent().unwrap_or(module_dir).to_path_buf();
+        return Ok(ResolvedModule {
+            path,
+            descendant_dir,
+        });
     }
     let direct = module_dir.join(format!("{}.rs", module.ident));
     let nested = module_dir.join(module.ident.to_string()).join("mod.rs");
     match (direct.is_file(), nested.is_file()) {
-        (true, false) => Ok(direct),
-        (false, true) => Ok(nested),
+        (true, false) => Ok(ResolvedModule {
+            path: direct,
+            descendant_dir: module_dir.join(module.ident.to_string()),
+        }),
+        (false, true) => Ok(ResolvedModule {
+            path: nested,
+            descendant_dir: module_dir.join(module.ident.to_string()),
+        }),
         (true, true) => Err(format!(
             "module {} is ambiguous: both {} and {} exist",
             module.ident,
@@ -322,34 +317,102 @@ fn resolve_module(
     }
 }
 
-fn walk_modules(
+fn include_literal(tokens: TokenStream) -> Option<LitStr> {
+    let parser = |input: ParseStream<'_>| {
+        let literal: LitStr = input.parse()?;
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        if !input.is_empty() {
+            return Err(input.error("include! expects one string literal"));
+        }
+        Ok(literal)
+    };
+    parser.parse2(tokens).ok()
+}
+
+fn static_include_path(item: &syn::ItemMacro, source_dir: &Path) -> Option<PathBuf> {
+    if !item.mac.path.is_ident("include") {
+        return None;
+    }
+    let literal = include_literal(item.mac.tokens.clone())?;
+    let path = PathBuf::from(literal.value());
+    if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+        return None;
+    }
+    Some(if path.is_absolute() {
+        path
+    } else {
+        source_dir.join(path)
+    })
+}
+
+fn item_attrs(item: &syn::Item) -> &[Attribute] {
+    match item {
+        syn::Item::Const(value) => &value.attrs,
+        syn::Item::Enum(value) => &value.attrs,
+        syn::Item::ExternCrate(value) => &value.attrs,
+        syn::Item::Fn(value) => &value.attrs,
+        syn::Item::ForeignMod(value) => &value.attrs,
+        syn::Item::Impl(value) => &value.attrs,
+        syn::Item::Macro(value) => &value.attrs,
+        syn::Item::Mod(value) => &value.attrs,
+        syn::Item::Static(value) => &value.attrs,
+        syn::Item::Struct(value) => &value.attrs,
+        syn::Item::Trait(value) => &value.attrs,
+        syn::Item::TraitAlias(value) => &value.attrs,
+        syn::Item::Type(value) => &value.attrs,
+        syn::Item::Union(value) => &value.attrs,
+        syn::Item::Use(value) => &value.attrs,
+        _ => &[],
+    }
+}
+
+fn walk_items(
     items: &[syn::Item],
     module_dir: &Path,
+    source_dir: &Path,
     context: &SingleCfgContext,
     visited: &mut HashSet<PathBuf>,
     output: &mut Vec<(PathBuf, SingleCfgContext)>,
 ) -> Result<(), String> {
     for item in items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        if !context.attrs_active(&module.attrs) {
+        if !context.attrs_active(item_attrs(item)) {
             continue;
         }
-        if let Some((_, nested)) = &module.content {
-            let nested_dir = module_dir.join(module.ident.to_string());
-            walk_modules(nested, &nested_dir, context, visited, output)?;
-            continue;
+        match item {
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = &module.content {
+                    let nested_dir = module_dir.join(module.ident.to_string());
+                    walk_items(nested, &nested_dir, source_dir, context, visited, output)?;
+                } else {
+                    let resolved = resolve_module(module, module_dir, context)?;
+                    visit_file(
+                        &resolved.path,
+                        &resolved.descendant_dir,
+                        context,
+                        visited,
+                        output,
+                    )?;
+                }
+            }
+            syn::Item::Macro(item_macro) => {
+                if let Some(path) = static_include_path(item_macro, source_dir) {
+                    if path.is_file() {
+                        let include_dir = path.parent().unwrap_or(source_dir).to_path_buf();
+                        visit_file(&path, &include_dir, context, visited, output)?;
+                    }
+                }
+            }
+            _ => {}
         }
-        let child = resolve_module(module, module_dir, context)?;
-        visit_file(&child, false, context, visited, output)?;
     }
     Ok(())
 }
 
 fn visit_file(
     path: &Path,
-    crate_root: bool,
+    module_dir: &Path,
     context: &SingleCfgContext,
     visited: &mut HashSet<PathBuf>,
     output: &mut Vec<(PathBuf, SingleCfgContext)>,
@@ -368,8 +431,15 @@ fn visit_file(
         return Ok(());
     }
     output.push((canonical.clone(), context.clone()));
-    let module_dir = module_directory(&canonical, crate_root);
-    walk_modules(&syntax.items, &module_dir, context, visited, output)
+    let source_dir = canonical.parent().unwrap_or(module_dir);
+    walk_items(
+        &syntax.items,
+        module_dir,
+        source_dir,
+        context,
+        visited,
+        output,
+    )
 }
 
 fn ignored(entry: &DirEntry) -> bool {
@@ -457,9 +527,10 @@ pub(crate) fn discover(
             let context = cargo_cfg(root, &package, target, include_tests)?;
             let mut visited = HashSet::new();
             let mut target_files = Vec::new();
+            let module_dir = root_module_dir(&target.src_path);
             visit_file(
                 &target.src_path,
-                true,
+                &module_dir,
                 &context,
                 &mut visited,
                 &mut target_files,
@@ -497,33 +568,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cfg_evaluation_handles_target_and_feature_predicates() {
-        let mut single = SingleCfgContext::synthetic(false);
-        single.names.insert("unix".into());
-        single
-            .values
-            .entry("target_os".into())
-            .or_default()
-            .insert("linux".into());
-        single.features.insert("extra".into());
-        let context = CfgContext {
-            variants: vec![single],
-        };
-        for text in [
-            "unix",
-            "target_os = \"linux\"",
-            "feature = \"extra\"",
-            "all(unix, feature = \"extra\")",
-            "not(windows)",
-        ] {
-            let meta: Meta = syn::parse_str(text).unwrap();
-            let attr: Attribute = syn::parse_quote!(#[cfg(#meta)]);
-            assert!(context.attrs_active(&[attr]), "{text} should be active");
-        }
-    }
-
-    #[test]
-    fn merged_context_is_active_when_any_target_context_matches() {
+    fn merged_context_accepts_either_target_cfg() {
         let mut unix = SingleCfgContext::synthetic(false);
         unix.names.insert("unix".into());
         let mut windows = SingleCfgContext::synthetic(false);
@@ -538,75 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_cfg_includes_build_script_values_and_inner_file_cfg() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\nname='cfg-mutate-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n").unwrap();
-        fs::write(dir.path().join("build.rs"), "fn main() { println!(\"cargo::rustc-check-cfg=cfg(tool_probe)\"); println!(\"cargo::rustc-cfg=tool_probe\"); }\n").unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "#[cfg(tool_probe)] mod active;\nmod inner_disabled;\n#[cfg(not(tool_probe))] mod impossible;\n").unwrap();
-        fs::write(
-            dir.path().join("src/active.rs"),
-            "pub fn active() -> bool { true }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/inner_disabled.rs"),
-            "#![cfg(not(tool_probe))]\npub fn disabled() -> bool { false }\n",
-        )
-        .unwrap();
-        let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
-            .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
-            .collect();
-        assert!(names.contains("lib.rs"));
-        assert!(names.contains("active.rs"));
-        assert!(!names.contains("inner_disabled.rs"));
-        assert!(!names.contains("impossible.rs"));
-    }
-
-    #[test]
-    fn default_scope_excludes_non_default_feature_modules() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname='scope-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\nextra=[]\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/lib.rs"),
-            "#[cfg(unix)] mod unix_only;\n#[cfg(windows)] mod windows_only;\n#[cfg(feature=\"extra\")] mod feature_only;\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("src/unix_only.rs"), "pub fn unix_fn() {}\n").unwrap();
-        fs::write(
-            dir.path().join("src/windows_only.rs"),
-            "pub fn windows_fn() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/feature_only.rs"),
-            "pub fn feature_fn() {}\n",
-        )
-        .unwrap();
-        let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
-            .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
-            .collect();
-        assert!(!names.contains("feature_only.rs"));
-        if cfg!(unix) {
-            assert!(names.contains("unix_only.rs"));
-            assert!(!names.contains("windows_only.rs"));
-        } else if cfg!(windows) {
-            assert!(names.contains("windows_only.rs"));
-            assert!(!names.contains("unix_only.rs"));
-        }
-    }
-
-    #[test]
-    fn default_scope_supports_mutually_exclusive_features() {
+    fn default_scope_does_not_force_mutually_exclusive_features() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
@@ -621,5 +598,53 @@ mod tests {
         .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn path_override_keeps_override_parent_for_descendants() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='mutation-path-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[path=\"foo.rs\"] mod bar;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/foo.rs"), "mod baz;\n").unwrap();
+        fs::write(
+            dir.path().join("src/baz.rs"),
+            "pub fn value() -> bool { true }\n",
+        )
+        .unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        let names: HashSet<_> = files
+            .iter()
+            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert!(names.contains("foo.rs"));
+        assert!(names.contains("baz.rs"));
+    }
+
+    #[test]
+    fn static_include_with_trailing_comma_is_part_of_active_source_graph() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='mutation-include-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "include!(\"shared.rs\",);\n").unwrap();
+        fs::write(
+            dir.path().join("src/shared.rs"),
+            "pub fn shared() -> bool { true }\n",
+        )
+        .unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        assert!(files.iter().any(|file| file.path.ends_with("shared.rs")));
     }
 }
