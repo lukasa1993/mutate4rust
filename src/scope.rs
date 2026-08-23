@@ -174,16 +174,6 @@ impl CfgContext {
             .iter()
             .any(|context| context.attrs_active(attrs))
     }
-
-    pub(crate) fn single_variants(&self) -> Vec<Self> {
-        self.variants
-            .iter()
-            .cloned()
-            .map(|context| Self {
-                variants: vec![context],
-            })
-            .collect()
-    }
 }
 
 fn contexts_for_tests(context: SingleCfgContext, include_tests: bool) -> Vec<SingleCfgContext> {
@@ -620,7 +610,7 @@ mod tests {
         let test: Attribute = syn::parse_quote!(#[cfg(test)]);
         assert!(context.attrs_active(&[production]));
         assert!(context.attrs_active(&[test]));
-        assert_eq!(context.single_variants().len(), 2);
+        assert_eq!(context.variants.len(), 2);
     }
 
     #[test]
