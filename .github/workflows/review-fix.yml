@@ -1,0 +1,49 @@
+name: Apply review fixes
+
+on:
+  push:
+    branches: [review-fix-v207]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: review-fix-v207
+          fetch-depth: 0
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Apply reviewed source changes
+        run: |
+          mkdir -p target
+          rustc tools/review_fix.rs -o target/review-fix
+          target/review-fix
+          cargo fmt --all
+      - name: Verify repaired package
+        run: |
+          cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/metadata.json"
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+          cargo build --locked --release
+          cargo install --path . --locked --root target/native-install --force
+          target/native-install/bin/mutate4rust --version
+          target/native-install/bin/mutate4rust --help >/dev/null
+      - name: Publish source-only repair
+        shell: bash
+        run: |
+          rm .github/workflows/review-fix.yml tools/review_fix.rs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/lib.rs src/scope.rs .github/workflows/review-fix.yml tools/review_fix.rs
+          git commit -m "Fix included mutation source handling"
+          git fetch origin review-fix-v207
+          git rebase origin/review-fix-v207
+          git push origin HEAD:review-fix-v207
