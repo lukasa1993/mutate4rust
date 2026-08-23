@@ -1,0 +1,58 @@
+name: Remove unused audit helper
+
+on:
+  push:
+    branches: [audit-test-cfg-scope-20260823]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[unused-fixed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit-test-cfg-scope-20260823
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Apply repair with native Rust
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/patch.rs" <<'RS'
+          use std::fs;
+          fn main() {
+              let path = "src/scope.rs";
+              let mut text = fs::read_to_string(path).unwrap();
+              let method = r##"
+    pub(crate) fn single_variants(&self) -> Vec<Self> {
+        self.variants
+            .iter()
+            .cloned()
+            .map(|context| Self {
+                variants: vec![context],
+            })
+            .collect()
+    }
+"##;
+              assert_eq!(text.matches(method).count(), 1);
+              text = text.replacen(method, "", 1);
+              let old = "assert_eq!(context.single_variants().len(), 2);";
+              assert_eq!(text.matches(old).count(), 1);
+              text = text.replacen(old, "assert_eq!(context.variants.len(), 2);", 1);
+              fs::write(path, text).unwrap();
+          }
+          RS
+          rustc --edition=2021 "$RUNNER_TEMP/patch.rs" -o "$RUNNER_TEMP/patch"
+          "$RUNNER_TEMP/patch"
+          cargo fmt --all
+      - name: Commit repair and remove patcher
+        shell: bash
+        run: |
+          git rm .github/workflows/audit-remove-unused.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/scope.rs
+          git commit -m 'Remove unused cfg helper [unused-fixed]'
+          git push origin HEAD:audit-test-cfg-scope-20260823
