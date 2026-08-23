@@ -43,6 +43,22 @@ jobs:
             target/native-install/bin/mutate4rust --version
             target/native-install/bin/mutate4rust --help >/dev/null
           fi
+      - name: End-to-end explicit feature selection
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/feature-crate"
+          tool="$GITHUB_WORKSPACE/target/native-install/bin/mutate4rust"
+          default_output="$($tool --root "$fixture" --list --json)"
+          printf '%s\n' "$default_output"
+          if grep -q '"original": "true"' <<<"$default_output"; then
+            echo 'feature-only mutation leaked into default feature scope' >&2
+            exit 1
+          fi
+          feature_output="$($tool --root "$fixture" --features extra --list --json)"
+          printf '%s\n' "$feature_output"
+          grep -q '"original": "true"' <<<"$feature_output"
+          grep -q '"replacement": "false"' <<<"$feature_output"
 
   msrv:
     runs-on: ubuntu-latest
