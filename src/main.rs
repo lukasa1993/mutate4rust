@@ -6,13 +6,15 @@ use mutate4rust::{
     VERSION,
 };
 use serde::Serialize;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 const DEFAULT_TEST: &str = "cargo test --workspace";
 const DEFAULT_VALIDATE: &str = "cargo check --workspace";
+const RUN_LOCK: &str = "target/mutation/run.lock";
 
 #[derive(Parser, Debug)]
 #[command(name = "mutate4rust", version = VERSION, about = "Native syntax-aware mutation testing for Rust")]
@@ -76,6 +78,146 @@ struct Summary {
     compile_error: usize,
 }
 
+struct RunLock {
+    file: File,
+}
+
+impl RunLock {
+    fn acquire(root: &Path) -> Result<Self, Error> {
+        let path = root.join(RUN_LOCK);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if !try_lock_file(&file)? {
+            return Err(Error::Mutation(format!(
+                "another mutate4rust process holds {}",
+                path.display()
+            )));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        unlock_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd;
+
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl WinOverlapped {
+    fn zeroed() -> Self {
+        Self {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    #[link_name = "LockFileEx"]
+    fn lock_file_ex(
+        file: *mut std::ffi::c_void,
+        flags: u32,
+        reserved: u32,
+        bytes_low: u32,
+        bytes_high: u32,
+        overlapped: *mut WinOverlapped,
+    ) -> i32;
+    #[link_name = "UnlockFileEx"]
+    fn unlock_file_ex(
+        file: *mut std::ffi::c_void,
+        reserved: u32,
+        bytes_low: u32,
+        bytes_high: u32,
+        overlapped: *mut WinOverlapped,
+    ) -> i32;
+    #[link_name = "GetLastError"]
+    fn get_last_error() -> u32;
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const ERROR_LOCK_VIOLATION: u32 = 33;
+
+    let mut overlapped = WinOverlapped::zeroed();
+    let result = unsafe {
+        lock_file_ex(
+            file.as_raw_handle(),
+            LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(true);
+    }
+    let code = unsafe { get_last_error() };
+    if code == ERROR_LOCK_VIOLATION {
+        Ok(false)
+    } else {
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut overlapped = WinOverlapped::zeroed();
+    let _ = unsafe { unlock_file_ex(file.as_raw_handle(), 0, 1, 0, &mut overlapped) };
+}
+
 fn resolve(root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -125,6 +267,7 @@ fn require_successful_baseline(
 fn run() -> Result<u8, Error> {
     let args = Args::parse();
     let root = args.root.canonicalize()?;
+    let _run_lock = RunLock::acquire(&root)?;
     let cargo_args =
         cargo_proxy::feature_args(&args.features, args.all_features, args.no_default_features);
     let _cargo_proxy = cargo_proxy::install(&root, "mutate4rust", &cargo_args)?;
@@ -224,5 +367,21 @@ fn main() -> ExitCode {
             eprintln!("mutate4rust: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn second_mutation_process_lock_is_rejected_until_release() {
+        let dir = tempdir().unwrap();
+        let first = RunLock::acquire(dir.path()).unwrap();
+        let second = RunLock::acquire(dir.path());
+        assert!(matches!(second, Err(Error::Mutation(_))));
+        drop(first);
+        RunLock::acquire(dir.path()).unwrap();
     }
 }
