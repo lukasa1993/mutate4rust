@@ -148,7 +148,7 @@ impl SingleCfgContext {
                 }
                 Meta::List(list) if list.path.is_ident("cfg_attr") => {
                     let items = parse_meta_list(list.tokens.clone())?;
-                    let (predicate, nested)) = items.split_first()?;
+                    let (predicate, nested) = items.split_first()?;
                     if context.eval(predicate) {
                         nested.iter().find_map(|meta| from_meta(context, meta))
                     } else {
