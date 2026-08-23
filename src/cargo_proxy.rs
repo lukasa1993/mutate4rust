@@ -223,7 +223,10 @@ mod tests {
             &fake,
         );
         let proxy = dir.path().join(executable_name("cargo-proxy"));
-        compile(&proxy_source(&["--features".into(), "extra".into()]), &proxy);
+        compile(
+            &proxy_source(&["--features".into(), "extra".into()]),
+            &proxy,
+        );
 
         let output = Command::new(&proxy)
             .env(REAL_CARGO_ENV, &fake)
@@ -242,6 +245,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "--version");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "--version"
+        );
     }
 }
