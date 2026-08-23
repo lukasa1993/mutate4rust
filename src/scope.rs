@@ -9,12 +9,17 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Lit, Meta, Token};
 use walkdir::{DirEntry, WalkDir};
 
-#[derive(Clone, Debug)]
-pub(crate) struct CfgContext {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SingleCfgContext {
     names: HashSet<String>,
     values: HashMap<String, HashSet<String>>,
     features: HashSet<String>,
     include_tests: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CfgContext {
+    variants: Vec<SingleCfgContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +65,7 @@ fn literal_string(expr: &Expr) -> Option<String> {
     }
 }
 
-impl CfgContext {
+impl SingleCfgContext {
     fn synthetic(include_tests: bool) -> Self {
         Self {
             names: HashSet::new(),
@@ -107,11 +112,9 @@ impl CfgContext {
     fn meta_attribute_active(&self, meta: &Meta) -> bool {
         match meta {
             Meta::Path(path) if path.is_ident("test") => self.include_tests,
-            Meta::List(list) if list.path.is_ident("cfg") => {
-                syn::parse2::<Meta>(list.tokens.clone())
-                    .ok()
-                    .is_none_or(|predicate| self.eval(&predicate))
-            }
+            Meta::List(list) if list.path.is_ident("cfg") => syn::parse2::<Meta>(list.tokens.clone())
+                .ok()
+                .is_none_or(|predicate| self.eval(&predicate)),
             Meta::List(list) if list.path.is_ident("cfg_attr") => {
                 let Some(items) = parse_meta_list(list.tokens.clone()) else {
                     return true;
@@ -128,7 +131,7 @@ impl CfgContext {
         }
     }
 
-    pub(crate) fn attrs_active(&self, attrs: &[Attribute]) -> bool {
+    fn attrs_active(&self, attrs: &[Attribute]) -> bool {
         attrs.iter().all(|attribute| {
             if attribute.path().is_ident("test") {
                 return self.include_tests;
@@ -148,7 +151,7 @@ impl CfgContext {
     }
 
     fn path_override(&self, attrs: &[Attribute]) -> Option<PathBuf> {
-        fn from_meta(context: &CfgContext, meta: &Meta) -> Option<PathBuf> {
+        fn from_meta(context: &SingleCfgContext, meta: &Meta) -> Option<PathBuf> {
             match meta {
                 Meta::NameValue(value) if value.path.is_ident("path") => {
                     literal_string(&value.value).map(PathBuf::from)
@@ -171,8 +174,22 @@ impl CfgContext {
     }
 }
 
-fn parse_cfg_output(text: &str, include_tests: bool) -> CfgContext {
-    let mut context = CfgContext::synthetic(include_tests);
+impl CfgContext {
+    fn synthetic(include_tests: bool) -> Self {
+        Self {
+            variants: vec![SingleCfgContext::synthetic(include_tests)],
+        }
+    }
+
+    pub(crate) fn attrs_active(&self, attrs: &[Attribute]) -> bool {
+        self.variants
+            .iter()
+            .any(|context| context.attrs_active(attrs))
+    }
+}
+
+fn parse_cfg_output(text: &str, include_tests: bool) -> SingleCfgContext {
+    let mut context = SingleCfgContext::synthetic(include_tests);
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Some((key, value)) = line.split_once('=') {
             let value = value.trim_matches('"').to_string();
@@ -196,15 +213,16 @@ fn cargo_cfg(
     package: &Package,
     target: &Target,
     include_tests: bool,
-) -> Result<CfgContext, String> {
+) -> Result<SingleCfgContext, String> {
     let mut command = Command::new("cargo");
     command
         .arg("rustc")
         .arg("--manifest-path")
-        .arg(&package.manifest_path)
-        .arg("--all-features");
+        .arg(&package.manifest_path);
     if target.kind.iter().any(|kind| kind == "bin") {
         command.arg("--bin").arg(&target.name);
+    } else if target.kind.iter().any(|kind| kind == "test") {
+        command.arg("--test").arg(&target.name);
     } else {
         command.arg("--lib");
     }
@@ -215,8 +233,9 @@ fn cargo_cfg(
         .map_err(|error| format!("cannot run cargo rustc -- --print cfg: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "cargo rustc cfg discovery failed for {} with exit code {:?}: {}",
+            "cargo rustc cfg discovery failed for {} target {} with exit code {:?}: {}",
             package.manifest_path.display(),
+            target.name,
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -269,7 +288,7 @@ fn module_directory(path: &Path, crate_root: bool) -> PathBuf {
 fn resolve_module(
     module: &syn::ItemMod,
     module_dir: &Path,
-    context: &CfgContext,
+    context: &SingleCfgContext,
 ) -> Result<PathBuf, String> {
     if let Some(relative) = context.path_override(&module.attrs) {
         let path = module_dir.join(relative);
@@ -304,9 +323,9 @@ fn resolve_module(
 fn walk_modules(
     items: &[syn::Item],
     module_dir: &Path,
-    context: &CfgContext,
+    context: &SingleCfgContext,
     visited: &mut HashSet<PathBuf>,
-    output: &mut Vec<ActiveFile>,
+    output: &mut Vec<(PathBuf, SingleCfgContext)>,
 ) -> Result<(), String> {
     for item in items {
         let syn::Item::Mod(module) = item else {
@@ -329,9 +348,9 @@ fn walk_modules(
 fn visit_file(
     path: &Path,
     crate_root: bool,
-    context: &CfgContext,
+    context: &SingleCfgContext,
     visited: &mut HashSet<PathBuf>,
-    output: &mut Vec<ActiveFile>,
+    output: &mut Vec<(PathBuf, SingleCfgContext)>,
 ) -> Result<(), String> {
     let canonical = path
         .canonicalize()
@@ -346,10 +365,7 @@ fn visit_file(
     if !context.attrs_active(&syntax.attrs) {
         return Ok(());
     }
-    output.push(ActiveFile {
-        path: canonical.clone(),
-        cfg: context.clone(),
-    });
+    output.push((canonical.clone(), context.clone()));
     let module_dir = module_directory(&canonical, crate_root);
     walk_modules(&syntax.items, &module_dir, context, visited, output)
 }
@@ -404,6 +420,17 @@ fn fallback_files(root: &Path, include_tests: bool) -> Vec<ActiveFile> {
     files
 }
 
+fn merge_context(
+    merged: &mut HashMap<PathBuf, Vec<SingleCfgContext>>,
+    path: PathBuf,
+    context: SingleCfgContext,
+) {
+    let contexts = merged.entry(path).or_default();
+    if !contexts.contains(&context) {
+        contexts.push(context);
+    }
+}
+
 pub(crate) fn discover(
     root: &Path,
     include_tests: bool,
@@ -414,37 +441,50 @@ pub(crate) fn discover(
     }
     let metadata = cargo_metadata(root)?;
     let workspace: HashSet<_> = metadata.workspace_members.into_iter().collect();
-    let mut output = Vec::new();
-    let mut visited = HashSet::new();
+    let mut merged = HashMap::<PathBuf, Vec<SingleCfgContext>>::new();
     for package in metadata
         .packages
         .into_iter()
         .filter(|package| workspace.contains(&package.id))
     {
-        let targets: Vec<_> = package
+        for target in package
             .targets
             .iter()
             .filter(|target| target_in_scope(&target.kind, include_tests))
-            .collect();
-        let Some(cfg_target) = targets.first().copied() else {
-            continue;
-        };
-        let context = cargo_cfg(root, &package, cfg_target, include_tests)?;
-        for target in targets {
-            visit_file(&target.src_path, true, &context, &mut visited, &mut output)?;
+        {
+            let context = cargo_cfg(root, &package, target, include_tests)?;
+            let mut visited = HashSet::new();
+            let mut target_files = Vec::new();
+            visit_file(
+                &target.src_path,
+                true,
+                &context,
+                &mut visited,
+                &mut target_files,
+            )?;
+            for (path, context) in target_files {
+                merge_context(&mut merged, path, context);
+            }
         }
     }
-    output.retain(|file| {
-        if filters.is_empty() {
-            return true;
-        }
-        let relative = file
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&file.path)
-            .to_string_lossy();
-        filters.iter().any(|filter| relative.contains(filter))
-    });
+    let mut output: Vec<_> = merged
+        .into_iter()
+        .map(|(path, variants)| ActiveFile {
+            path,
+            cfg: CfgContext { variants },
+        })
+        .filter(|file| {
+            if filters.is_empty() {
+                return true;
+            }
+            let relative = file
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&file.path)
+                .to_string_lossy();
+            filters.iter().any(|filter| relative.contains(filter))
+        })
+        .collect();
     output.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(output)
 }
@@ -456,14 +496,17 @@ mod tests {
 
     #[test]
     fn cfg_evaluation_handles_target_and_feature_predicates() {
-        let mut context = CfgContext::synthetic(false);
-        context.names.insert("unix".into());
-        context
+        let mut single = SingleCfgContext::synthetic(false);
+        single.names.insert("unix".into());
+        single
             .values
             .entry("target_os".into())
             .or_default()
             .insert("linux".into());
-        context.features.insert("extra".into());
+        single.features.insert("extra".into());
+        let context = CfgContext {
+            variants: vec![single],
+        };
         for text in [
             "unix",
             "target_os = \"linux\"",
@@ -472,15 +515,31 @@ mod tests {
             "not(windows)",
         ] {
             let meta: Meta = syn::parse_str(text).unwrap();
-            assert!(context.eval(&meta), "{text} should be active");
+            let attr: Attribute = syn::parse_quote!(#[cfg(#meta)]);
+            assert!(context.attrs_active(&[attr]), "{text} should be active");
         }
+    }
+
+    #[test]
+    fn merged_context_is_active_when_any_target_context_matches() {
+        let mut unix = SingleCfgContext::synthetic(false);
+        unix.names.insert("unix".into());
+        let mut windows = SingleCfgContext::synthetic(false);
+        windows.names.insert("windows".into());
+        let context = CfgContext {
+            variants: vec![unix, windows],
+        };
+        let unix_attr: Attribute = syn::parse_quote!(#[cfg(unix)]);
+        let windows_attr: Attribute = syn::parse_quote!(#[cfg(windows)]);
+        assert!(context.attrs_active(&[unix_attr]));
+        assert!(context.attrs_active(&[windows_attr]));
     }
 
     #[test]
     fn cargo_cfg_includes_build_script_values_and_inner_file_cfg() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\nname='cfg-mutation-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n").unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname='cfg-mutate-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n").unwrap();
         fs::write(dir.path().join("build.rs"), "fn main() { println!(\"cargo::rustc-check-cfg=cfg(tool_probe)\"); println!(\"cargo::rustc-cfg=tool_probe\"); }\n").unwrap();
         fs::write(dir.path().join("src/lib.rs"), "#[cfg(tool_probe)] mod active;\nmod inner_disabled;\n#[cfg(not(tool_probe))] mod impossible;\n").unwrap();
         fs::write(
@@ -505,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_scope_excludes_inactive_external_modules() {
+    fn default_scope_excludes_non_default_feature_modules() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
@@ -518,19 +577,15 @@ mod tests {
             "#[cfg(unix)] mod unix_only;\n#[cfg(windows)] mod windows_only;\n#[cfg(feature=\"extra\")] mod feature_only;\n",
         )
         .unwrap();
-        fs::write(
-            dir.path().join("src/unix_only.rs"),
-            "pub fn unix_fn() { let _ = true; }\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("src/unix_only.rs"), "pub fn unix_fn() {}\n").unwrap();
         fs::write(
             dir.path().join("src/windows_only.rs"),
-            "pub fn windows_fn() { let _ = false; }\n",
+            "pub fn windows_fn() {}\n",
         )
         .unwrap();
         fs::write(
             dir.path().join("src/feature_only.rs"),
-            "pub fn feature_fn() { let _ = true; }\n",
+            "pub fn feature_fn() {}\n",
         )
         .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
@@ -538,8 +593,7 @@ mod tests {
             .iter()
             .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
             .collect();
-        assert!(names.contains("lib.rs"));
-        assert!(names.contains("feature_only.rs"));
+        assert!(!names.contains("feature_only.rs"));
         if cfg!(unix) {
             assert!(names.contains("unix_only.rs"));
             assert!(!names.contains("windows_only.rs"));
@@ -547,5 +601,23 @@ mod tests {
             assert!(names.contains("windows_only.rs"));
             assert!(!names.contains("unix_only.rs"));
         }
+    }
+
+    #[test]
+    fn default_scope_supports_mutually_exclusive_features() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='mutually-exclusive-mutation-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\na=[]\nb=[]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[cfg(all(feature=\"a\", feature=\"b\"))] compile_error!(\"features a and b are mutually exclusive\");\npub fn active() -> bool { true }\n",
+        )
+        .unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        assert_eq!(files.len(), 1);
     }
 }
