@@ -26,12 +26,21 @@ jobs:
         run: cargo metadata --locked --format-version 1 --no-deps > ${{ runner.temp }}/metadata.json
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --locked --all-targets --all-features
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Documentation
+        shell: bash
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
       - name: Build release
         run: cargo build --locked --release
+      - name: Package
+        run: cargo package --locked
+      - name: Cargo install
+        run: cargo install --path . --locked --force
       - name: Cargo install smoke test
         shell: bash
         run: |
