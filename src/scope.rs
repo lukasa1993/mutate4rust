@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use syn::parse::Parser;
+use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Lit, LitStr, Meta, Token};
 use walkdir::{DirEntry, WalkDir};
@@ -117,9 +117,11 @@ impl SingleCfgContext {
     fn meta_attribute_active(&self, meta: &Meta) -> bool {
         match meta {
             Meta::Path(path) if path.is_ident("test") => self.include_tests,
-            Meta::List(list) if list.path.is_ident("cfg") => syn::parse2::<Meta>(list.tokens.clone())
-                .ok()
-                .is_none_or(|predicate| self.eval(&predicate)),
+            Meta::List(list) if list.path.is_ident("cfg") => {
+                syn::parse2::<Meta>(list.tokens.clone())
+                    .ok()
+                    .is_none_or(|predicate| self.eval(&predicate))
+            }
             Meta::List(list) if list.path.is_ident("cfg_attr") => {
                 let Some(items) = parse_meta_list(list.tokens.clone()) else {
                     return true;
@@ -137,7 +139,9 @@ impl SingleCfgContext {
     }
 
     fn attrs_active(&self, attrs: &[Attribute]) -> bool {
-        attrs.iter().all(|attribute| self.meta_attribute_active(&attribute.meta))
+        attrs
+            .iter()
+            .all(|attribute| self.meta_attribute_active(&attribute.meta))
     }
 
     fn path_override(&self, attrs: &[Attribute]) -> Option<PathBuf> {
@@ -172,7 +176,9 @@ impl CfgContext {
     }
 
     pub(crate) fn attrs_active(&self, attrs: &[Attribute]) -> bool {
-        self.variants.iter().any(|context| context.attrs_active(attrs))
+        self.variants
+            .iter()
+            .any(|context| context.attrs_active(attrs))
     }
 }
 
@@ -261,7 +267,9 @@ fn target_in_scope(kind: &[String], include_tests: bool) -> bool {
 }
 
 fn root_module_dir(path: &Path) -> PathBuf {
-    path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
 }
 
 fn resolve_module(
@@ -309,16 +317,34 @@ fn resolve_module(
     }
 }
 
+fn include_literal(tokens: TokenStream) -> Option<LitStr> {
+    let parser = |input: ParseStream<'_>| {
+        let literal: LitStr = input.parse()?;
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        if !input.is_empty() {
+            return Err(input.error("include! expects one string literal"));
+        }
+        Ok(literal)
+    };
+    parser.parse2(tokens).ok()
+}
+
 fn static_include_path(item: &syn::ItemMacro, source_dir: &Path) -> Option<PathBuf> {
     if !item.mac.path.is_ident("include") {
         return None;
     }
-    let literal = syn::parse2::<LitStr>(item.mac.tokens.clone()).ok()?;
-    let relative = PathBuf::from(literal.value());
-    if relative.is_absolute() || relative.extension().and_then(|value| value.to_str()) != Some("rs") {
+    let literal = include_literal(item.mac.tokens.clone())?;
+    let path = PathBuf::from(literal.value());
+    if path.extension().and_then(|value| value.to_str()) != Some("rs") {
         return None;
     }
-    Some(source_dir.join(relative))
+    Some(if path.is_absolute() {
+        path
+    } else {
+        source_dir.join(path)
+    })
 }
 
 fn item_attrs(item: &syn::Item) -> &[Attribute] {
@@ -583,9 +609,17 @@ mod tests {
             "[package]\nname='mutation-path-fixture'\nversion='0.1.0'\nedition='2021'\n",
         )
         .unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "#[path=\"foo.rs\"] mod bar;\n").unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[path=\"foo.rs\"] mod bar;\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("src/foo.rs"), "mod baz;\n").unwrap();
-        fs::write(dir.path().join("src/baz.rs"), "pub fn value() -> bool { true }\n").unwrap();
+        fs::write(
+            dir.path().join("src/baz.rs"),
+            "pub fn value() -> bool { true }\n",
+        )
+        .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
         let names: HashSet<_> = files
             .iter()
@@ -596,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn static_include_is_part_of_active_source_graph() {
+    fn static_include_with_trailing_comma_is_part_of_active_source_graph() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
@@ -604,8 +638,12 @@ mod tests {
             "[package]\nname='mutation-include-fixture'\nversion='0.1.0'\nedition='2021'\n",
         )
         .unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "include!(\"shared.rs\");\n").unwrap();
-        fs::write(dir.path().join("src/shared.rs"), "pub fn shared() -> bool { true }\n").unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "include!(\"shared.rs\",);\n").unwrap();
+        fs::write(
+            dir.path().join("src/shared.rs"),
+            "pub fn shared() -> bool { true }\n",
+        )
+        .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
         assert!(files.iter().any(|file| file.path.ends_with("shared.rs")));
     }
